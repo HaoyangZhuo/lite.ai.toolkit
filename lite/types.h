@@ -73,6 +73,24 @@ namespace lite {
     typedef BoundingBoxType<float, float> Boxf;
     typedef BoundingBoxType<double, double> Boxd;
 
+    // CPU wall-clock durations for backend-specific stages. Inference may
+    // include host/device transfers and synchronization when required.
+    typedef struct LITE_EXPORTS InferenceTimingType
+    {
+      double preprocess_ms;
+      double inference_ms;
+      double postprocess_ms;
+
+      InferenceTimingType() :
+          preprocess_ms(0.0), inference_ms(0.0), postprocess_ms(0.0)
+      {};
+
+      double total_ms() const
+      {
+        return preprocess_ms + inference_ms + postprocess_ms;
+      }
+    } InferenceTiming;
+
     typedef struct LITE_EXPORTS LandmarksType
     {
       std::vector<cv::Point2f> points; // x,y

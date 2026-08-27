@@ -1,16 +1,16 @@
 //
-// Created by zhuohaoyang on 2026/8/26.
+// Created by zhuohaoyang on 2026/8/27.
 //
 
-#include "yolov26.h"
-#include "lite/ort/core/ort_utils.h"
+#include "trt_yolov26.h"
+#include "lite/trt/core/trt_utils.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <stdexcept>
 
-using ortcv::YoloV26;
+using trtcv::TRTYoloV26;
 
 namespace
 {
@@ -36,41 +36,44 @@ namespace
   {
     return std::chrono::duration<double, std::milli>(end - start).count();
   }
+
+  void check_cuda(cudaError_t status, const char *operation)
+  {
+    if (status != cudaSuccess)
+      throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(status));
+  }
 }
 
-YoloV26::YoloV26(const std::string &_onnx_path, unsigned int _num_threads) :
-    BasicOrtHandler(_onnx_path, _num_threads)
+TRTYoloV26::TRTYoloV26(const std::string &_trt_model_path,
+                     unsigned int _num_threads) :
+    BasicTRTHandler(_trt_model_path, _num_threads)
 {
+  if (!trt_engine || !trt_context || !stream)
+    throw std::runtime_error("Failed to initialize YOLOV26 TensorRT engine");
+  if (trt_engine->getNbIOTensors() != 2 || buffers.size() != 2)
+    throw std::runtime_error("YOLOV26 expects exactly one input and one output tensor");
+
+  const char *input_name = trt_engine->getIOTensorName(0);
+  const char *output_name = trt_engine->getIOTensorName(1);
+  if (trt_engine->getTensorIOMode(input_name) != nvinfer1::TensorIOMode::kINPUT ||
+      trt_engine->getTensorIOMode(output_name) != nvinfer1::TensorIOMode::kOUTPUT)
+    throw std::runtime_error("YOLOV26 expects the input tensor before the output tensor");
+  if (trt_engine->getTensorDataType(input_name) != nvinfer1::DataType::kFLOAT ||
+      trt_engine->getTensorDataType(output_name) != nvinfer1::DataType::kFLOAT)
+    throw std::runtime_error("YOLOV26 expects float32 input and output tensors");
+
   if (input_node_dims.size() != 4 || input_node_dims[0] != 1 ||
       input_node_dims[1] != 3 || input_node_dims[2] <= 0 || input_node_dims[3] <= 0)
-    throw std::runtime_error("YoloV26 expects a static NCHW input with shape [1,3,H,W]");
-
-  if (num_outputs != 1 || output_node_dims[0].size() != 3 ||
-      output_node_dims[0][0] != 1 || output_node_dims[0][2] != 6)
-    throw std::runtime_error("YoloV26 expects one end-to-end output with shape [1,N,6]");
-
-  Ort::TypeInfo input_type_info = ort_session->GetInputTypeInfo(0);
-  Ort::TypeInfo output_type_info = ort_session->GetOutputTypeInfo(0);
-  auto input_info = input_type_info.GetTensorTypeAndShapeInfo();
-  auto output_info = output_type_info.GetTensorTypeAndShapeInfo();
-  if (input_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
-      output_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
-    throw std::runtime_error("YoloV26 expects float32 input and output tensors");
+    throw std::runtime_error("YOLOV26 expects a static NCHW input with shape [1,3,H,W]");
+  if (output_node_dims.size() != 1 || output_node_dims[0].size() != 3 ||
+      output_node_dims[0][0] != 1 || output_node_dims[0][1] <= 0 ||
+      output_node_dims[0][2] != 6)
+    throw std::runtime_error("YOLOV26 expects one end-to-end output with shape [1,N,6]");
 }
 
-Ort::Value YoloV26::transform(const cv::Mat &mat_rs)
-{
-  cv::Mat canvas;
-  cv::cvtColor(mat_rs, canvas, cv::COLOR_BGR2RGB);
-  canvas.convertTo(canvas, CV_32FC3, 1.f / 255.f);
-  return ortcv::utils::transform::create_tensor(
-      canvas, input_node_dims, memory_info_handler,
-      input_values_handler, ortcv::utils::transform::CHW);
-}
-
-void YoloV26::letterbox(const cv::Mat &mat, cv::Mat &mat_rs,
-                       int target_height, int target_width,
-                       ScaleParams &scale_params)
+void TRTYoloV26::letterbox(const cv::Mat &mat, cv::Mat &mat_rs,
+                          int target_height, int target_width,
+                          ScaleParams &scale_params)
 {
   const float scale = std::min(
       static_cast<float>(target_width) / static_cast<float>(mat.cols),
@@ -94,40 +97,60 @@ void YoloV26::letterbox(const cv::Mat &mat, cv::Mat &mat_rs,
   scale_params.top = top;
 }
 
-void YoloV26::detect(const cv::Mat &mat, std::vector<types::Boxf> &detected_boxes,
-                    float score_threshold, unsigned int topk)
+void TRTYoloV26::detect(const cv::Mat &mat,
+                       std::vector<types::Boxf> &detected_boxes,
+                       float score_threshold, unsigned int topk)
 {
   this->detect_with_timing(mat, detected_boxes, score_threshold, topk, nullptr);
 }
 
-void YoloV26::detect_with_timing(const cv::Mat &mat,
-                                 std::vector<types::Boxf> &detected_boxes,
-                                 float score_threshold, unsigned int topk,
-                                 types::InferenceTiming *timing)
+void TRTYoloV26::detect_with_timing(const cv::Mat &mat,
+                                    std::vector<types::Boxf> &detected_boxes,
+                                    float score_threshold, unsigned int topk,
+                                    types::InferenceTiming *timing)
 {
   detected_boxes.clear();
   if (timing) *timing = types::InferenceTiming();
   if (mat.empty()) return;
   if (mat.channels() != 3)
-    throw std::invalid_argument("YoloV26 expects a three-channel BGR image");
+    throw std::invalid_argument("YOLOV26 expects a three-channel BGR image");
 
   const auto preprocess_start = std::chrono::steady_clock::now();
   cv::Mat mat_rs;
   ScaleParams scale_params;
   this->letterbox(mat, mat_rs, static_cast<int>(input_node_dims[2]),
                   static_cast<int>(input_node_dims[3]), scale_params);
-  Ort::Value input_tensor = this->transform(mat_rs);
+  cv::cvtColor(mat_rs, mat_rs, cv::COLOR_BGR2RGB);
+  mat_rs.convertTo(mat_rs, CV_32FC3, 1.f / 255.f);
+
+  std::vector<float> input;
+  trtcv::utils::transform::create_tensor(
+      mat_rs, input, input_node_dims, trtcv::utils::transform::CHW);
   const auto preprocess_end = std::chrono::steady_clock::now();
 
+  const std::size_t input_size = static_cast<std::size_t>(input_node_dims[0]) *
+                                 static_cast<std::size_t>(input_node_dims[1]) *
+                                 static_cast<std::size_t>(input_node_dims[2]) *
+                                 static_cast<std::size_t>(input_node_dims[3]);
   const auto inference_start = std::chrono::steady_clock::now();
-  auto output_tensors = ort_session->Run(
-      Ort::RunOptions{nullptr}, input_node_names.data(), &input_tensor, 1,
-      output_node_names.data(), 1);
+  const auto &pred_dims = output_node_dims[0];
+  const std::size_t num_predictions = static_cast<std::size_t>(pred_dims[1]);
+  std::vector<float> output(num_predictions * 6);
+  check_cuda(cudaMemcpyAsync(buffers[0], input.data(), input_size * sizeof(float),
+                             cudaMemcpyHostToDevice, stream),
+             "YOLOV26 input copy failed");
+  if (!trt_context->enqueueV3(stream))
+    throw std::runtime_error("Failed to infer YOLOV26 with TensorRT");
+  check_cuda(cudaMemcpyAsync(output.data(), buffers[1], output.size() * sizeof(float),
+                             cudaMemcpyDeviceToHost, stream),
+             "YOLOV26 output copy failed");
+  check_cuda(cudaStreamSynchronize(stream), "YOLOV26 inference synchronization failed");
   const auto inference_end = std::chrono::steady_clock::now();
 
   const auto postprocess_start = std::chrono::steady_clock::now();
-  this->generate_bboxes(scale_params, detected_boxes, output_tensors,
-                        score_threshold, topk, mat.rows, mat.cols);
+  this->generate_bboxes(scale_params, detected_boxes, output.data(),
+                        num_predictions, score_threshold, topk,
+                        mat.rows, mat.cols);
   const auto postprocess_end = std::chrono::steady_clock::now();
 
   if (timing)
@@ -138,24 +161,17 @@ void YoloV26::detect_with_timing(const cv::Mat &mat,
   }
 }
 
-void YoloV26::generate_bboxes(const ScaleParams &scale_params,
-                             std::vector<types::Boxf> &detected_boxes,
-                             std::vector<Ort::Value> &output_tensors,
-                             float score_threshold, unsigned int topk,
-                             int img_height, int img_width)
+void TRTYoloV26::generate_bboxes(const ScaleParams &scale_params,
+                                std::vector<types::Boxf> &detected_boxes,
+                                const float *output,
+                                std::size_t num_predictions,
+                                float score_threshold, unsigned int topk,
+                                int img_height, int img_width)
 {
-  Ort::Value &pred = output_tensors.at(0);
-  auto tensor_info = pred.GetTensorTypeAndShapeInfo();
-  auto dims = tensor_info.GetShape();
-  if (tensor_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
-      dims.size() != 3 || dims[0] != 1 || dims[2] != 6 || dims[1] < 0)
-    throw std::runtime_error("Unexpected YoloV26 output; expected float32 [1,N,6]");
-
-  const float *data = pred.GetTensorData<float>();
-  detected_boxes.reserve(static_cast<std::size_t>(dims[1]));
-  for (int64_t i = 0; i < dims[1]; ++i)
+  detected_boxes.reserve(num_predictions);
+  for (std::size_t i = 0; i < num_predictions; ++i)
   {
-    const float *row = data + i * 6;
+    const float *row = output + i * 6;
     const float score = row[4];
     const float class_value = row[5];
     if (!std::isfinite(score) || score < score_threshold ||
