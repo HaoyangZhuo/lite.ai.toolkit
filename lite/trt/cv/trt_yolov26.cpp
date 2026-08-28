@@ -6,6 +6,7 @@
 #include "lite/trt/core/trt_utils.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <stdexcept>
 
@@ -22,6 +23,12 @@ namespace
   {
     if (status != cudaSuccess)
       throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(status));
+  }
+
+  double elapsed_ms(const std::chrono::steady_clock::time_point &start,
+                    const std::chrono::steady_clock::time_point &end)
+  {
+    return std::chrono::duration<double, std::milli>(end - start).count();
   }
 }
 
@@ -50,6 +57,35 @@ TRTYoloV26::TRTYoloV26(const std::string &_trt_model_path,
       output_node_dims[0][0] != 1 || output_node_dims[0][1] <= 0 ||
       output_node_dims[0][2] != 6)
     throw std::runtime_error("YOLOV26 expects one end-to-end output with shape [1,N,6]");
+
+  for (auto &event : timing_events)
+  {
+    const cudaError_t status = cudaEventCreate(&event);
+    if (status != cudaSuccess)
+    {
+      for (auto &created_event : timing_events)
+      {
+        if (created_event)
+        {
+          cudaEventDestroy(created_event);
+          created_event = nullptr;
+        }
+      }
+      check_cuda(status, "Failed to create YOLOV26 timing event");
+    }
+  }
+}
+
+TRTYoloV26::~TRTYoloV26()
+{
+  for (auto &event : timing_events)
+  {
+    if (event)
+    {
+      cudaEventDestroy(event);
+      event = nullptr;
+    }
+  }
 }
 
 void TRTYoloV26::letterbox(const cv::Mat &mat, cv::Mat &mat_rs,
@@ -82,11 +118,33 @@ void TRTYoloV26::detect(const cv::Mat &mat,
                        std::vector<types::Boxf> &detected_boxes,
                        float score_threshold, unsigned int topk)
 {
+  this->detect_impl(mat, detected_boxes, score_threshold, topk, nullptr);
+}
+
+void TRTYoloV26::detect_with_timing(const cv::Mat &mat,
+                                   std::vector<types::Boxf> &detected_boxes,
+                                   Timing &timing,
+                                   float score_threshold, unsigned int topk)
+{
+  this->detect_impl(mat, detected_boxes, score_threshold, topk, &timing);
+}
+
+void TRTYoloV26::detect_impl(const cv::Mat &mat,
+                            std::vector<types::Boxf> &detected_boxes,
+                            float score_threshold, unsigned int topk,
+                            Timing *timing)
+{
+  using Clock = std::chrono::steady_clock;
+
   detected_boxes.clear();
+  if (timing) *timing = Timing{};
+  const auto total_start = Clock::now();
+
   if (mat.empty()) return;
   if (mat.channels() != 3)
     throw std::invalid_argument("YOLOV26 expects a three-channel BGR image");
 
+  const auto preprocess_start = Clock::now();
   cv::Mat mat_rs;
   ScaleParams scale_params;
   this->letterbox(mat, mat_rs, static_cast<int>(input_node_dims[2]),
@@ -97,7 +155,9 @@ void TRTYoloV26::detect(const cv::Mat &mat,
   std::vector<float> input;
   trtcv::utils::transform::create_tensor(
       mat_rs, input, input_node_dims, trtcv::utils::transform::CHW);
+  const auto preprocess_end = Clock::now();
 
+  const auto backend_start = Clock::now();
   const std::size_t input_size = static_cast<std::size_t>(input_node_dims[0]) *
                                  static_cast<std::size_t>(input_node_dims[1]) *
                                  static_cast<std::size_t>(input_node_dims[2]) *
@@ -105,19 +165,55 @@ void TRTYoloV26::detect(const cv::Mat &mat,
   const auto &pred_dims = output_node_dims[0];
   const std::size_t num_predictions = static_cast<std::size_t>(pred_dims[1]);
   std::vector<float> output(num_predictions * 6);
+
+  if (timing)
+    check_cuda(cudaEventRecord(timing_events[0], stream), "Failed to record YOLOV26 H2D start");
   check_cuda(cudaMemcpyAsync(buffers[0], input.data(), input_size * sizeof(float),
                              cudaMemcpyHostToDevice, stream),
              "YOLOV26 input copy failed");
+  if (timing)
+    check_cuda(cudaEventRecord(timing_events[1], stream), "Failed to record YOLOV26 inference start");
+
   if (!trt_context->enqueueV3(stream))
     throw std::runtime_error("Failed to infer YOLOV26 with TensorRT");
+  if (timing)
+    check_cuda(cudaEventRecord(timing_events[2], stream), "Failed to record YOLOV26 inference end");
+
   check_cuda(cudaMemcpyAsync(output.data(), buffers[1], output.size() * sizeof(float),
                              cudaMemcpyDeviceToHost, stream),
              "YOLOV26 output copy failed");
+  if (timing)
+    check_cuda(cudaEventRecord(timing_events[3], stream), "Failed to record YOLOV26 D2H end");
   check_cuda(cudaStreamSynchronize(stream), "YOLOV26 inference synchronization failed");
+  const auto backend_end = Clock::now();
 
+  if (timing)
+  {
+    float duration = 0.f;
+    check_cuda(cudaEventElapsedTime(&duration, timing_events[0], timing_events[1]),
+               "Failed to measure YOLOV26 H2D time");
+    timing->h2d_ms = duration;
+    check_cuda(cudaEventElapsedTime(&duration, timing_events[1], timing_events[2]),
+               "Failed to measure YOLOV26 inference time");
+    timing->inference_ms = duration;
+    check_cuda(cudaEventElapsedTime(&duration, timing_events[2], timing_events[3]),
+               "Failed to measure YOLOV26 D2H time");
+    timing->d2h_ms = duration;
+  }
+
+  const auto postprocess_start = Clock::now();
   this->generate_bboxes(scale_params, detected_boxes, output.data(),
                         num_predictions, score_threshold, topk,
                         mat.rows, mat.cols);
+  const auto postprocess_end = Clock::now();
+
+  if (timing)
+  {
+    timing->preprocess_ms = elapsed_ms(preprocess_start, preprocess_end);
+    timing->backend_wall_ms = elapsed_ms(backend_start, backend_end);
+    timing->postprocess_ms = elapsed_ms(postprocess_start, postprocess_end);
+    timing->total_ms = elapsed_ms(total_start, postprocess_end);
+  }
 }
 
 void TRTYoloV26::generate_bboxes(const ScaleParams &scale_params,

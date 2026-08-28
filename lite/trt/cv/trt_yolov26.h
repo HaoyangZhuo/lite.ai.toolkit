@@ -12,10 +12,26 @@ namespace trtcv
   class LITE_EXPORTS TRTYoloV26 : public BasicTRTHandler
   {
   public:
+    struct Timing
+    {
+      double preprocess_ms = 0.0;
+      double h2d_ms = 0.0;
+      double inference_ms = 0.0;
+      double d2h_ms = 0.0;
+      double backend_wall_ms = 0.0;
+      double postprocess_ms = 0.0;
+      double total_ms = 0.0;
+
+      double gpu_pipeline_ms() const
+      {
+        return h2d_ms + inference_ms + d2h_ms;
+      }
+    };
+
     explicit TRTYoloV26(const std::string &_trt_model_path,
                        unsigned int _num_threads = 1);
 
-    ~TRTYoloV26() override = default;
+    ~TRTYoloV26() override;
 
   private:
     const char *coco_class_names[80] = {
@@ -37,10 +53,17 @@ namespace trtcv
       int top;
     } ScaleParams;
 
+    cudaEvent_t timing_events[4] = {nullptr, nullptr, nullptr, nullptr};
+
   private:
     void letterbox(const cv::Mat &mat, cv::Mat &mat_rs,
                    int target_height, int target_width,
                    ScaleParams &scale_params);
+
+    void detect_impl(const cv::Mat &mat,
+                     std::vector<types::Boxf> &detected_boxes,
+                     float score_threshold, unsigned int topk,
+                     Timing *timing);
 
     void generate_bboxes(const ScaleParams &scale_params,
                          std::vector<types::Boxf> &detected_boxes,
@@ -51,6 +74,12 @@ namespace trtcv
   public:
     void detect(const cv::Mat &mat, std::vector<types::Boxf> &detected_boxes,
                 float score_threshold = 0.25f, unsigned int topk = 100);
+
+    void detect_with_timing(const cv::Mat &mat,
+                            std::vector<types::Boxf> &detected_boxes,
+                            Timing &timing,
+                            float score_threshold = 0.25f,
+                            unsigned int topk = 100);
   };
 }
 
