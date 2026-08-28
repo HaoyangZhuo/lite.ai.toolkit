@@ -442,10 +442,69 @@ Because Stage 4 uses newly built precision-matched controls and averages indepen
 - The reference engine is loaded after timing but remains simultaneously resident during output comparison; memory metrics are captured before that load.
 - `cudaMemGetInfo` is not per-process accounting and may be perturbed by concurrent GPU users. Independent runs and raw snapshots reduce but do not eliminate that limitation.
 - The benchmark image validates postprocessed output only. Dataset-level mAP requires real labeled validation assets and must not be inferred from this smoke test.
-- Commit: `perf(trt): benchmark YOLOv26 FP16 precision` (hash added after commit).
+- Commit: `3b308fc` (`perf(trt): benchmark YOLOv26 FP16 precision`).
 
-## Remaining isolated stage
+## Stage 5: INT8 PTQ feasibility — blocked by missing data assets
 
-1. INT8 post-training calibration and accuracy/latency comparison, only if real calibration and validation assets are available.
+### Investigation result
 
-The stage will append its exact code change, A/B delta, correctness result, limitations, and commit identifier after measurement, or document the concrete asset/API blocker without fabricating accuracy data.
+No INT8 engine was built or benchmarked. The current environment cannot produce a scientifically valid PTQ result because it contains neither a representative calibration corpus nor a labeled validation set. Building an engine merely because TensorRT accepts `--int8` would create a number, but not a defensible calibrated model.
+
+The source ONNX was inspected with the locally installed ONNX package:
+
+| Property | Result |
+|---|---:|
+| ONNX bytes / opset / graph nodes | 9,942,064 / 18 / 384 |
+| `QuantizeLinear` / `DequantizeLinear` nodes | 0 / 0 |
+| Other integer quantization operators | 0 |
+| Quantization annotations | 0 |
+| FP32 initializers | 209 |
+| INT8 / UINT8 initializers | 0 / 0 |
+| External input / output | FP32 `[1,3,640,640]` / FP32 `[1,300,6]` |
+
+This is a non-Q/DQ FP32 graph with no explicit quantization scales or usable TensorRT dynamic ranges.
+
+A recursive asset inventory found 319 image files, but they are not a coherent calibration or validation dataset:
+
+- `examples/lite/resources` contains 89 heterogeneous demo fixtures spanning detection, classification, faces, restoration, and segmentation;
+- documentation images are a mixture of inputs, rendered outputs, masks, screenshots, and animations;
+- `examples/logs` and `build/yolo26-export/cpp_result*` are generated inference outputs rather than independent source samples;
+- ignored vendored trees contain unrelated third-party assets;
+- installed Ultralytics `coco*.yaml` files are dataset download recipes, not downloaded data.
+
+There is no `train2017`, `val2017`, COCO annotation JSON, YOLO label directory, or project-specific labeled validation corpus. The repository also contains no TensorRT calibrator implementation and no calibration cache.
+
+### Why bare `trtexec --int8` was rejected
+
+TensorRT 10.9 `trtexec` exposes `--int8` and `--calib=<cache>`, but that does not make bare `--int8` a data-calibrated workflow. Inspection of the installed TensorRT 10.9 sample/trtexec source shows:
+
+- for a non-Q/DQ network with `--int8` and no cache, trtexec assigns hard-coded dummy symmetric ranges;
+- a requested cache path is only useful if a valid cache already exists;
+- when that cache is missing, its sample calibrator supplies one random input batch and does not produce a reusable calibrated cache.
+
+Those paths are suitable for API plumbing demonstrations, not YOLOv26 PTQ quality evaluation. Consequently this stage deliberately did **not**:
+
+- run bare `--int8` and present its latency as a valid PTQ result;
+- calibrate from the one benchmark image, generated result images, or heterogeneous demo fixtures;
+- infer accuracy from repeated deterministic inference on one image;
+- report fabricated COCO mAP or an “accuracy preserved” claim.
+
+### Exact requirements to resume
+
+A valid Stage 5 measurement requires all of the following:
+
+1. A documented, representative calibration image set matching expected deployment traffic. For COCO-oriented evaluation, use a real training/calibration subset rather than repository demos.
+2. A disjoint labeled validation set, such as COCO `val2017` plus `annotations/instances_val2017.json`, and a reproducible evaluator for the 80-class end-to-end output.
+3. A build-time calibrator or explicit Q/DQ export. An implicit TensorRT calibrator must reproduce YOLOv26 preprocessing exactly: aspect-preserving resize, 114 letterbox padding, BGR-to-RGB, `/255`, and FP32 CHW.
+4. Recorded calibration algorithm, deterministic image order/count, cache hash, ONNX/engine hashes, TensorRT version, FP32 external I/O, and layer-dump evidence that INT8 tactics were actually selected.
+5. Independent 20-warmup/200-sample ABBA latency runs against the Stage 4 FP32 and FP16 controls, plus engine size, memory, output-difference, and labeled mAP comparisons.
+
+Until those assets are supplied, FP16 is the fastest configuration in this environment that has both reproducible engine construction and a real, if single-image-limited, correctness check.
+
+### Stage status
+
+- INT8 implementation: **not performed; representative calibration data absent**.
+- INT8 latency/size/memory: **not reported; no valid calibrated engine exists**.
+- INT8 mAP: **not measurable; labeled validation images and annotations absent**.
+- Outcome: **concrete external-data blocker documented without manufacturing results**.
+- Commit: `docs(trt): document YOLOv26 INT8 calibration blocker` (hash reported after commit).
