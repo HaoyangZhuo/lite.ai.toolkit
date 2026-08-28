@@ -16,6 +16,8 @@
 #include <vector>
 
 #ifdef ENABLE_TENSORRT
+#include <cuda_runtime_api.h>
+
 namespace
 {
   using Detector = lite::trt::cv::detection::YOLOV26;
@@ -104,6 +106,135 @@ namespace
         return false;
     }
     return true;
+  }
+
+  struct CudaMemorySnapshot
+  {
+    std::size_t free_bytes = 0;
+    std::size_t total_bytes = 0;
+  };
+
+  struct PrecisionComparison
+  {
+    std::size_t primary_boxes = 0;
+    std::size_t reference_boxes = 0;
+    std::size_t matched = 0;
+    std::size_t unmatched_primary = 0;
+    std::size_t unmatched_reference = 0;
+    std::size_t same_index_label_mismatches = 0;
+    double minimum_iou = 0.0;
+    double mean_iou = 0.0;
+    double maximum_score_abs_error = 0.0;
+    double maximum_coordinate_abs_error = 0.0;
+  };
+
+  CudaMemorySnapshot cuda_memory_snapshot()
+  {
+    cudaError_t status = cudaDeviceSynchronize();
+    if (status != cudaSuccess)
+      throw std::runtime_error(std::string("cudaDeviceSynchronize failed: ") +
+                               cudaGetErrorString(status));
+
+    CudaMemorySnapshot snapshot;
+    status = cudaMemGetInfo(&snapshot.free_bytes, &snapshot.total_bytes);
+    if (status != cudaSuccess)
+      throw std::runtime_error(std::string("cudaMemGetInfo failed: ") +
+                               cudaGetErrorString(status));
+    return snapshot;
+  }
+
+  long long consumed_bytes(const CudaMemorySnapshot &before,
+                           const CudaMemorySnapshot &after)
+  {
+    return static_cast<long long>(before.free_bytes) -
+           static_cast<long long>(after.free_bytes);
+  }
+
+  float box_iou(const lite::types::Boxf &first, const lite::types::Boxf &second)
+  {
+    const float left = std::max(first.x1, second.x1);
+    const float top = std::max(first.y1, second.y1);
+    const float right = std::min(first.x2, second.x2);
+    const float bottom = std::min(first.y2, second.y2);
+    const float intersection = std::max(0.0f, right - left) *
+                               std::max(0.0f, bottom - top);
+    const float first_area = std::max(0.0f, first.x2 - first.x1) *
+                             std::max(0.0f, first.y2 - first.y1);
+    const float second_area = std::max(0.0f, second.x2 - second.x1) *
+                              std::max(0.0f, second.y2 - second.y1);
+    const float union_area = first_area + second_area - intersection;
+    return union_area > 0.0f ? intersection / union_area : 0.0f;
+  }
+
+  PrecisionComparison compare_precision_outputs(
+      const std::vector<lite::types::Boxf> &primary,
+      const std::vector<lite::types::Boxf> &reference,
+      float minimum_match_iou = 0.5f)
+  {
+    struct Candidate
+    {
+      std::size_t primary_index;
+      std::size_t reference_index;
+      float iou;
+    };
+
+    PrecisionComparison comparison;
+    comparison.primary_boxes = primary.size();
+    comparison.reference_boxes = reference.size();
+    const std::size_t common_size = std::min(primary.size(), reference.size());
+    for (std::size_t i = 0; i < common_size; ++i)
+      if (primary[i].label != reference[i].label)
+        ++comparison.same_index_label_mismatches;
+
+    std::vector<Candidate> candidates;
+    for (std::size_t i = 0; i < primary.size(); ++i)
+      for (std::size_t j = 0; j < reference.size(); ++j)
+      {
+        if (primary[i].label != reference[j].label) continue;
+        const float iou = box_iou(primary[i], reference[j]);
+        if (iou >= minimum_match_iou) candidates.push_back({i, j, iou});
+      }
+    std::sort(candidates.begin(), candidates.end(),
+              [](const Candidate &first, const Candidate &second)
+              {
+                if (first.iou != second.iou) return first.iou > second.iou;
+                if (first.primary_index != second.primary_index)
+                  return first.primary_index < second.primary_index;
+                return first.reference_index < second.reference_index;
+              });
+
+    std::vector<bool> primary_matched(primary.size(), false);
+    std::vector<bool> reference_matched(reference.size(), false);
+    double iou_sum = 0.0;
+    for (const Candidate &candidate : candidates)
+    {
+      if (primary_matched[candidate.primary_index] ||
+          reference_matched[candidate.reference_index])
+        continue;
+      primary_matched[candidate.primary_index] = true;
+      reference_matched[candidate.reference_index] = true;
+      const auto &primary_box = primary[candidate.primary_index];
+      const auto &reference_box = reference[candidate.reference_index];
+      ++comparison.matched;
+      iou_sum += candidate.iou;
+      if (comparison.matched == 1 || candidate.iou < comparison.minimum_iou)
+        comparison.minimum_iou = candidate.iou;
+      comparison.maximum_score_abs_error = std::max(
+          comparison.maximum_score_abs_error,
+          static_cast<double>(std::fabs(primary_box.score - reference_box.score)));
+      comparison.maximum_coordinate_abs_error = std::max({
+          comparison.maximum_coordinate_abs_error,
+          static_cast<double>(std::fabs(primary_box.x1 - reference_box.x1)),
+          static_cast<double>(std::fabs(primary_box.y1 - reference_box.y1)),
+          static_cast<double>(std::fabs(primary_box.x2 - reference_box.x2)),
+          static_cast<double>(std::fabs(primary_box.y2 - reference_box.y2))});
+    }
+
+    comparison.unmatched_primary = primary.size() - comparison.matched;
+    comparison.unmatched_reference = reference.size() - comparison.matched;
+    if (comparison.matched != 0)
+      comparison.mean_iou = iou_sum / static_cast<double>(comparison.matched);
+    return comparison;
   }
 
   int positive_integer(const char *value, const char *name)
@@ -258,10 +389,11 @@ int main(int argc, char *argv[])
   std::cerr << "This benchmark requires ENABLE_TENSORRT=ON" << std::endl;
   return EXIT_FAILURE;
 #else
-  if (argc < 3 || argc > 5)
+  if (argc < 3 || argc > 6)
   {
     std::cerr << "Usage: " << argv[0]
               << " <engine_path> <image_path> [warmup=20] [iterations=200]"
+              << " [reference_engine_path]"
               << std::endl;
     return EXIT_FAILURE;
   }
@@ -272,12 +404,15 @@ int main(int argc, char *argv[])
     const std::string image_path = argv[2];
     const int warmup = argc >= 4 ? positive_integer(argv[3], "warmup") : 20;
     const int iterations = argc >= 5 ? positive_integer(argv[4], "iterations") : 200;
+    const std::string reference_engine_path = argc >= 6 ? argv[5] : "";
 
     cv::Mat image = cv::imread(image_path);
     if (image.empty())
       throw std::runtime_error("Failed to read benchmark image: " + image_path);
 
+    const CudaMemorySnapshot memory_before_detector = cuda_memory_snapshot();
     Detector detector(engine_path);
+    const CudaMemorySnapshot memory_after_detector = cuda_memory_snapshot();
     std::cout << std::fixed << std::setprecision(6);
     std::cout << "preprocess_validation,layout,elements,mismatched_exact,mean_abs_error,p99_abs_error,max_abs_error\n";
     require_exact_preprocess(detector, "benchmark_image", image);
@@ -296,6 +431,7 @@ int main(int argc, char *argv[])
              &graph_prepare_timing);
     if (!graph_prepare_timing.graph_replayed || graph_prepare_timing.graph_fallback)
       throw std::runtime_error("CUDA Graph capture/replay is unavailable for benchmark input");
+    const CudaMemorySnapshot memory_after_initial_graph = cuda_memory_snapshot();
 
     const int fallback_rows = image.rows == 319 ? 320 : 319;
     const int fallback_cols = image.cols == 511 ? 512 : 511;
@@ -342,6 +478,8 @@ int main(int argc, char *argv[])
         throw std::runtime_error("Baseline, CUDA stream, and CUDA Graph detections differ during warmup");
       reference_boxes = baseline_boxes;
     }
+    // Includes the 2048x2048 staging-growth validation and the recaptured graph.
+    const CudaMemorySnapshot memory_after_preflight = cuda_memory_snapshot();
 
     Samples baseline;
     Samples stream_samples;
@@ -384,9 +522,32 @@ int main(int argc, char *argv[])
     const double stream_samples_fps = 1000.0 / stream_samples_total;
     const double optimized_fps = 1000.0 / optimized_total;
 
+    PrecisionComparison precision_comparison;
+    if (!reference_engine_path.empty())
+    {
+      Detector reference_detector(reference_engine_path);
+      std::vector<lite::types::Boxf> cross_precision_reference_boxes;
+      run_once(reference_detector, image, PipelineMode::Baseline,
+               cross_precision_reference_boxes, nullptr);
+      precision_comparison = compare_precision_outputs(
+          reference_boxes, cross_precision_reference_boxes);
+    }
+
     std::cout << std::fixed << std::setprecision(6);
     std::cout << "engine," << engine_path << '\n';
     std::cout << "image," << image_path << '\n';
+    std::cout << "cuda_total_bytes," << memory_before_detector.total_bytes << '\n';
+    std::cout << "cuda_free_before_detector_bytes," << memory_before_detector.free_bytes << '\n';
+    std::cout << "cuda_free_after_detector_load_bytes," << memory_after_detector.free_bytes << '\n';
+    std::cout << "cuda_free_after_initial_graph_bytes," << memory_after_initial_graph.free_bytes << '\n';
+    std::cout << "cuda_free_after_preflight_bytes," << memory_after_preflight.free_bytes << '\n';
+    std::cout << "cuda_detector_load_consumed_bytes,"
+              << consumed_bytes(memory_before_detector, memory_after_detector) << '\n';
+    std::cout << "cuda_preprocess_and_initial_graph_consumed_bytes,"
+              << consumed_bytes(memory_after_detector, memory_after_initial_graph) << '\n';
+    std::cout << "cuda_preflight_consumed_bytes,"
+              << consumed_bytes(memory_before_detector, memory_after_preflight) << '\n';
+    std::cout << "cuda_preflight_includes_2048_staging,true\n";
     std::cout << "warmup_sets," << warmup << '\n';
     std::cout << "measured_sets," << iterations << '\n';
     std::cout << "boxes," << reference_boxes.size() << '\n';
@@ -396,6 +557,27 @@ int main(int argc, char *argv[])
     std::cout << "graph_fallbacks," << measured_graph_fallbacks << '\n';
     std::cout << "shape_fallback_validation,passed\n";
     std::cout << "staging_growth_validation,passed\n";
+    if (!reference_engine_path.empty())
+    {
+      std::cout << "precision_reference_engine," << reference_engine_path << '\n';
+      std::cout << "precision_comparison_scope,postprocessed_single_image_smoke_test\n";
+      std::cout << "precision_match_iou_threshold,0.500000\n";
+      std::cout << "precision_primary_boxes," << precision_comparison.primary_boxes << '\n';
+      std::cout << "precision_reference_boxes," << precision_comparison.reference_boxes << '\n';
+      std::cout << "precision_matched_boxes," << precision_comparison.matched << '\n';
+      std::cout << "precision_unmatched_primary_boxes,"
+                << precision_comparison.unmatched_primary << '\n';
+      std::cout << "precision_unmatched_reference_boxes,"
+                << precision_comparison.unmatched_reference << '\n';
+      std::cout << "precision_same_index_label_mismatches,"
+                << precision_comparison.same_index_label_mismatches << '\n';
+      std::cout << "precision_min_iou," << precision_comparison.minimum_iou << '\n';
+      std::cout << "precision_mean_iou," << precision_comparison.mean_iou << '\n';
+      std::cout << "precision_max_score_abs_error,"
+                << precision_comparison.maximum_score_abs_error << '\n';
+      std::cout << "precision_max_coordinate_abs_error,"
+                << precision_comparison.maximum_coordinate_abs_error << '\n';
+    }
     std::cout << "mode,metric,mean_ms,p50_ms,p95_ms,min_ms\n";
     print_samples("baseline", baseline);
     print_samples("previous_cuda_stream", stream_samples);

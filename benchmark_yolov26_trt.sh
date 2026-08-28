@@ -7,6 +7,7 @@ ENGINE_PATH="${1:-${ROOT_DIR}/build/yolo26-export/yolo26n_fp32.engine}"
 IMAGE_PATH="${2:-${ROOT_DIR}/examples/lite/resources/test_lite_detection_1.jpg}"
 WARMUP="${3:-20}"
 ITERATIONS="${4:-200}"
+REFERENCE_ENGINE_PATH="${5:-}"
 JOBS="${JOBS:-1}"
 
 if [[ ! -f "${BUILD_DIR}/CMakeCache.txt" ]]; then
@@ -22,6 +23,11 @@ fi
 
 if [[ ! -f "${IMAGE_PATH}" ]]; then
   echo "Missing benchmark image: ${IMAGE_PATH}" >&2
+  exit 1
+fi
+
+if [[ -n "${REFERENCE_ENGINE_PATH}" && ! -f "${REFERENCE_ENGINE_PATH}" ]]; then
+  echo "Missing reference TensorRT engine: ${REFERENCE_ENGINE_PATH}" >&2
   exit 1
 fi
 
@@ -47,4 +53,8 @@ if [[ ! -x "${BENCHMARK_BIN}" ]]; then
 fi
 
 export LD_LIBRARY_PATH="${ROOT_DIR}/third_party/opencv/lib:${LD_LIBRARY_PATH:-}"
-"${BENCHMARK_BIN}" "${ENGINE_PATH}" "${IMAGE_PATH}" "${WARMUP}" "${ITERATIONS}"
+BENCHMARK_ARGS=("${ENGINE_PATH}" "${IMAGE_PATH}" "${WARMUP}" "${ITERATIONS}")
+if [[ -n "${REFERENCE_ENGINE_PATH}" ]]; then
+  BENCHMARK_ARGS+=("${REFERENCE_ENGINE_PATH}")
+fi
+"${BENCHMARK_BIN}" "${BENCHMARK_ARGS[@]}"

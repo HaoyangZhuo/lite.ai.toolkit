@@ -19,7 +19,7 @@ This document records each optimization independently. Every stage uses the same
 Run the benchmark with:
 
 ```bash
-./benchmark_yolov26_trt.sh [engine] [image] [warmup] [iterations]
+./benchmark_yolov26_trt.sh [engine] [image] [warmup] [iterations] [reference_engine]
 ```
 
 The script reuses `build/yolo26-trt`, refreshes only the CMake generation step, incrementally builds the `lite_yolov26_benchmark` target, and runs it. Build output is saved under the build directory instead of flooding benchmark output.
@@ -320,11 +320,132 @@ Cross-run final speedup over Stage 0: **2.618169x**.
 - Graph replay remains shape/address-specific. Nonmatching images use safe stream fallback rather than graph updates. A detector holds one active graph signature at a time.
 - Five external event nodes are intentionally part of both measured graph and normal-stream paths. They make segment timing reproducible but add small overhead to production calls.
 - The detector remains single-call-at-a-time and is not thread-safe.
-- Commit: `perf(trt): replay YOLOv26 pipeline with CUDA Graph` (hash added by the next documentation commit).
+- Commit: `a1500d8` (`perf(trt): replay YOLOv26 pipeline with CUDA Graph`).
 
-## Remaining isolated stages
+## Stage 4: FP16 internal compute with FP32 I/O
 
-1. FP16 engine build and accuracy/latency comparison.
-2. INT8 post-training calibration and accuracy/latency comparison.
+### Engine construction and precision boundary
 
-Each stage will append its exact code change, A/B delta, correctness result, limitations, and commit identifier after measurement.
+Stage 4 adds `build_yolov26_trt_engines.sh` so the precision comparison does not depend on the older FP32 engine whose exact build command is unknown. It builds a new FP32 control and an FP16 candidate from the same ONNX file and explicit flags:
+
+```bash
+./build_yolov26_trt_engines.sh all \
+  build/yolo26-export/yolo26n.onnx \
+  build/yolo26-export
+```
+
+Both engines use `--inputIOFormats=fp32:chw`, `--outputIOFormats=fp32:chw`, `--builderOptimizationLevel=3`, detailed layer export, and `--skipInference`. The FP16 candidate alone adds `--fp16`. TensorRT's default TF32 behavior remains enabled for the FP32 control; it is therefore an FP32 control with default TF32 tactic selection, not a strict no-TF32 engine.
+
+The external precision boundary is intentional: the existing fused CUDA kernel writes `float`, the handler allocates binding storage using `sizeof(float)`, and postprocessing consumes FP32 output. The FP16 layer dump reports Float input `[1,3,640,640]`, Half internal reformats/convolutions (681 Half datatype entries), and Float `output0` `[1,300,6]`. This stage tests reduced internal compute precision without conflating it with FP16 I/O.
+
+Source model and generated artifacts:
+
+| Artifact | Bytes | SHA-256 |
+|---|---:|---|
+| `yolo26n.onnx` | 9,942,064 | `e11058a62d4532cf3af29e7a3f32968f9782bad067ef4a2dbdb3a61d6d037ac0` |
+| FP32 control engine | 15,756,292 | `ea41d6b4f7e818e18e6d30020bd772ed5b77e277ff04059178a5de1a2398108c` |
+| FP16 engine | 8,309,244 | `8a171552ec9964367d71b3ed39f514a83f52b930b5dccfafce25051bce293e3d` |
+
+FP16 reduces the serialized engine by **7,447,048 bytes (47.263963%)**, from 15.026371 MiB to 7.924313 MiB. Engines, build logs, layer dumps, and benchmark logs stay in ignored `build/` paths and are not committed.
+
+### Benchmark and comparison method
+
+The benchmark now accepts an optional reference engine. It completes all primary-engine warmup and measured samples before loading the reference engine, so reference deserialization/inference cannot affect reported primary latency. Cross-precision detections are matched one-to-one by numeric class and descending IoU with an IoU floor of 0.5; the report includes unmatched counts, same-index class changes, minimum/mean IoU, and maximum score/coordinate differences. This matcher is separate from the strict `1e-3` same-engine execution-path gate.
+
+GPU memory is sampled with synchronized `cudaMemGetInfo` calls before detector construction, after detector load, after initial graph preparation, and after all preflight/warmup work. The final preflight snapshot explicitly includes retained 2048x2048 raw-image staging from the graph growth test. FP32 and FP16 memory deltas are measured in separate processes, before the optional reference engine is loaded.
+
+Four independent processes were run in ABBA order, each with 20 warmup sets and 200 measured sets:
+
+```bash
+# A1 and A2
+./benchmark_yolov26_trt.sh \
+  build/yolo26-export/yolo26n_fp32_stage4.engine \
+  examples/lite/resources/test_lite_detection_1.jpg 20 200
+
+# B1 and B2; the FP32 control is loaded only after FP16 timing
+./benchmark_yolov26_trt.sh \
+  build/yolo26-export/yolo26n_fp16.engine \
+  examples/lite/resources/test_lite_detection_1.jpg 20 200 \
+  build/yolo26-export/yolo26n_fp32_stage4.engine
+```
+
+All four runs passed all nine exact preprocessing gates, 200/200 same-engine detection checks, shape fallback, staging growth/recapture, and 200 graph replays with zero measured graph fallbacks.
+
+### Independent-run results
+
+| Run | Engine | Inference (ms) | GPU pipeline (ms) | Backend wall (ms) | Total wall (ms) | FPS |
+|---|---|---:|---:|---:|---:|---:|
+| A1 | FP32 control | 1.326541 | 1.488915 | 1.508882 | 1.739050 | 575.026509 |
+| B1 | FP16 internal | 0.747069 | 0.909686 | 0.919489 | 1.099937 | 909.142627 |
+| B2 | FP16 internal | 0.748078 | 0.915606 | 0.925776 | 1.106076 | 904.097075 |
+| A2 | FP32 control | 1.338020 | 1.501965 | 1.512656 | 1.709258 | 585.049076 |
+
+The aggregate below is the arithmetic mean of the two per-engine run means, not a selectively chosen run:
+
+| Metric | FP32 control mean | FP16 mean | Absolute delta | Delta |
+|---|---:|---:|---:|---:|
+| CPU raw pack (ms) | 0.2094975 | 0.1766975 | -0.0328000 | -15.656511% |
+| Raw H2D (ms) | 0.1106260 | 0.1106820 | +0.0000560 | +0.050621% |
+| GPU preprocess (ms) | 0.0449105 | 0.0469900 | +0.0020795 | +4.630320% |
+| TensorRT inference (ms) | **1.3322805** | **0.7475735** | **-0.5847070** | **-43.887680%** |
+| D2H (ms) | 0.0076230 | 0.0074005 | -0.0002225 | -2.918798% |
+| GPU pipeline (ms) | **1.4954400** | **0.9126460** | **-0.5827940** | **-38.971406%** |
+| Backend wall (ms) | 1.5107690 | 0.9226325 | -0.5881365 | -38.929611% |
+| CPU postprocess (ms) | 0.0010695 | 0.0009610 | -0.0001085 | -10.144928% |
+| Total wall (ms) | **1.7241540** | **1.1030065** | **-0.6211475** | **-36.026219%** |
+| Throughput (FPS) | **580.0377925** | **906.6198510** | **+326.5820585** | **+56.303583%** |
+
+FP16 speedups are **1.782140x** for TensorRT inference, **1.638576x** for the GPU pipeline, and **1.563140x** end-to-end versus the matched FP32 control.
+
+### Engine and process memory
+
+| Measurement | FP32 control | FP16 | FP16 - FP32 |
+|---|---:|---:|---:|
+| Builder-reported host persistent (bytes) | 611,680 | 598,000 | -13,680 |
+| Builder-reported device persistent (bytes) | 9,728 | 0 | -9,728 |
+| Builder scratch (bytes) | 2,953,728 | 1,477,632 | -1,476,096 |
+| Builder activation (bytes) | 18,662,400 | 9,420,800 | -9,241,600 |
+| Builder weights (bytes) | 10,510,272 | 4,908,832 | -5,601,440 |
+| Runtime runner allocation reported as scratch (bytes) | 18,662,400 | 9,420,800 | -9,241,600 |
+| `cudaMemGetInfo` detector-load delta (bytes) | 73,400,320 (70 MiB) | 102,760,448 (98 MiB) | +29,360,128 (+28 MiB) |
+| `cudaMemGetInfo` post-preflight delta (bytes) | 85,983,232 (82 MiB) | 115,343,360 (110 MiB) | +29,360,128 (+28 MiB) |
+
+Both independent runs of each precision produced the same byte deltas. The TensorRT engine-specific activation, weight, and runner allocation reports are smaller for FP16, but the observed process-level free-memory delta is **28 MiB larger**. These values are reported rather than normalized away: `cudaMemGetInfo` measures device-global free memory and includes allocator granularity plus precision/tactic-specific lazily loaded runtime resources, not only serialized weights or activation tensors. Therefore this environment does not support claiming a lower total process footprint for the FP16 engine even though its engine-specific allocations are smaller.
+
+### Detection-output comparison
+
+Both B runs produced identical FP16-versus-FP32 smoke-test results on the benchmark image:
+
+| Measurement | Result |
+|---|---:|
+| FP16 / FP32 boxes | 5 / 5 |
+| Class+IoU matched boxes | 5 |
+| Unmatched FP16 / FP32 boxes | 0 / 0 |
+| Same-index numeric class mismatches | 0 |
+| Minimum / mean matched IoU | 0.997070 / 0.998537 |
+| Maximum absolute score difference | 0.002752 |
+| Maximum absolute coordinate difference | 0.444672 pixels |
+
+This verifies stable detections for one image and exposes the actual numerical differences; it is **not an accuracy or mAP claim**. No COCO validation set is present in the workspace, so dataset-level FP16 quality remains unmeasured.
+
+### Relative to prior recorded stages
+
+Because Stage 4 uses newly built precision-matched controls and averages independent processes, same-stage FP32-versus-FP16 is the primary causal comparison. Cross-run cumulative figures are included only for historical context:
+
+- Versus Stage 3 Graph: total latency 1.846252 -> 1.1030065 ms (**-40.256991%, 1.673836x**); throughput 541.637771 -> 906.619851 FPS (**+67.384902%**).
+- Versus Stage 0: total latency 4.8338 -> 1.1030065 ms (**-77.181379%, 4.382386x**); throughput 206.8784 -> 906.619851 FPS (**+338.238043%**).
+
+### Risks and limitations
+
+- FP16 is hardware-, TensorRT-version-, and tactic-dependent. Engines are not portable substitutes for the reproducible ONNX-plus-build-script path.
+- External bindings remain FP32. Changing I/O to FP16 would require coordinated kernel, allocator, host-output, and postprocessing changes and would be a separate optimization.
+- The reference engine is loaded after timing but remains simultaneously resident during output comparison; memory metrics are captured before that load.
+- `cudaMemGetInfo` is not per-process accounting and may be perturbed by concurrent GPU users. Independent runs and raw snapshots reduce but do not eliminate that limitation.
+- The benchmark image validates postprocessed output only. Dataset-level mAP requires real labeled validation assets and must not be inferred from this smoke test.
+- Commit: `perf(trt): benchmark YOLOv26 FP16 precision` (hash added after commit).
+
+## Remaining isolated stage
+
+1. INT8 post-training calibration and accuracy/latency comparison, only if real calibration and validation assets are available.
+
+The stage will append its exact code change, A/B delta, correctness result, limitations, and commit identifier after measurement, or document the concrete asset/API blocker without fabricating accuracy data.
