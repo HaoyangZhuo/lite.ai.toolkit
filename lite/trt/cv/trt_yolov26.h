@@ -7,6 +7,8 @@
 
 #include "lite/trt/core/trt_core.h"
 
+#include <cstddef>
+
 namespace trtcv
 {
   class LITE_EXPORTS TRTYoloV26 : public BasicTRTHandler
@@ -16,6 +18,7 @@ namespace trtcv
     {
       double preprocess_ms = 0.0;
       double h2d_ms = 0.0;
+      double gpu_preprocess_ms = 0.0;
       double inference_ms = 0.0;
       double d2h_ms = 0.0;
       double backend_wall_ms = 0.0;
@@ -24,13 +27,23 @@ namespace trtcv
 
       double gpu_pipeline_ms() const
       {
-        return h2d_ms + inference_ms + d2h_ms;
+        return h2d_ms + gpu_preprocess_ms + inference_ms + d2h_ms;
       }
+    };
+
+    struct PreprocessComparison
+    {
+      std::size_t elements = 0;
+      std::size_t mismatched = 0;
+      double mean_abs_error = 0.0;
+      float max_abs_error = 0.0f;
+      float p99_abs_error = 0.0f;
     };
 
     enum class PipelineMode
     {
       Baseline,
+      PinnedCpu,
       Optimized
     };
 
@@ -57,18 +70,31 @@ namespace trtcv
       float scale;
       int left;
       int top;
+      int resized_width;
+      int resized_height;
     } ScaleParams;
 
-    cudaEvent_t timing_events[4] = {nullptr, nullptr, nullptr, nullptr};
+    cudaEvent_t timing_events[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
     std::vector<float> host_input;
     std::vector<float> host_output;
     bool host_input_registered = false;
     bool host_output_registered = false;
+    unsigned char *host_image = nullptr;
+    unsigned char *device_image = nullptr;
+    std::size_t image_capacity = 0;
 
   private:
-    void letterbox(const cv::Mat &mat, cv::Mat &mat_rs,
-                   int target_height, int target_width,
-                   ScaleParams &scale_params);
+    ScaleParams calculate_scale_params(const cv::Mat &mat) const;
+
+    void preprocess_cpu(const cv::Mat &mat, std::vector<float> &input,
+                        ScaleParams &scale_params);
+
+    void ensure_image_buffers(std::size_t required_bytes);
+
+    void pack_image(const cv::Mat &mat);
+
+    void enqueue_cuda_preprocess(const cv::Mat &mat,
+                                 const ScaleParams &scale_params);
 
     void detect_impl(const cv::Mat &mat,
                      std::vector<types::Boxf> &detected_boxes,
@@ -100,6 +126,8 @@ namespace trtcv
                             float score_threshold,
                             unsigned int topk,
                             PipelineMode mode);
+
+    PreprocessComparison compare_preprocess(const cv::Mat &mat);
   };
 }
 

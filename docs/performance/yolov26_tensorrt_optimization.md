@@ -132,13 +132,106 @@ Cross-run total speedup over Stage 0: **1.0040x**. The smaller cross-run gain an
 - The reusable vectors are registered rather than allocated with `cudaHostAlloc`; their fixed size and address are checked before transfer. The detector remains single-call-at-a-time because its context, stream, and reusable buffers are shared.
 - Pinned host memory is a limited OS/CUDA resource and remains registered for the detector lifetime. The destructor unregisters it.
 - Input preprocessing is still CPU OpenCV plus scalar HWC-to-CHW and dominates latency. Stage 2 targets this bottleneck.
-- Commit: `perf(trt): reuse pinned YOLOv26 host buffers` (the immutable hash is added by the next documentation commit because a commit cannot contain its own hash).
+- Commit: `dbd3ae9` (`perf(trt): reuse pinned YOLOv26 host buffers`).
+
+## Stage 2: fused CUDA preprocessing
+
+### Motivation and implementation
+
+After Stage 1, CPU letterbox/color conversion/normalization/CHW conversion still consumed about 2.8 ms and dominated end-to-end latency. Stage 2 adds YOLOv26-specific `yolov26_preprocess.cu/.cuh`. The optimized path now:
+
+1. packs the logical `CV_8UC3` rows into a reusable pinned raw-image staging allocation, respecting `cv::Mat::step` for non-contiguous inputs;
+2. asynchronously copies the compact BGR uint8 payload to a reusable device allocation;
+3. launches one CUDA kernel that performs bilinear resize, letterbox padding, BGR-to-RGB, uint8-to-FP32, `/255` normalization, and HWC-to-CHW;
+4. writes directly into the TensorRT input address `buffers[0]`, with no intermediate FP32 device tensor or tensor H2D copy.
+
+The kernel reproduces the 11-bit fixed-point `CV_8U` linear interpolation and two-stage rounding used by the [OpenCV 4.9 resize implementation](https://github.com/opencv/opencv/blob/4.9.0/modules/imgproc/src/resize.cpp), rather than using approximate float bilinear interpolation. Content was rephrased for compliance with licensing restrictions.
+
+Three modes are retained in one binary and detector instance:
+
+- `Baseline`: original per-frame local vectors, pageable FP32 tensor H2D, OpenCV CPU preprocessing.
+- `PinnedCpu`: the exact Stage 1 reusable/pinned FP32 host-tensor path.
+- `Optimized`: cumulative Stage 2 raw-image staging plus fused CUDA preprocessing.
+
+The benchmark uses six balanced permutations. Every mode occupies every execution slot, while the relative order of Baseline and Optimized alternates each set.
+
+### Reproduction
+
+```bash
+./benchmark_yolov26_trt.sh \
+  build/yolo26-export/yolo26n_fp32.engine \
+  examples/lite/resources/test_lite_detection_1.jpg \
+  20 200
+```
+
+`20` is the number of three-mode warmup sets and `200` is the number of measured three-mode sets, for 600 measured inference calls.
+
+### Exact preprocessing validation
+
+Validation is a hard benchmark gate: any non-finite or nonzero element difference fails before timing. Each tensor has 1,228,800 FP32 elements.
+
+| Input geometry/layout | Mismatched elements | Mean abs error | P99 abs error | Max abs error |
+|---|---:|---:|---:|---:|
+| Benchmark image, continuous | 0 | 0 | 0 | 0 |
+| Benchmark image, non-contiguous ROI | 0 | 0 | 0 | 0 |
+| 319x511 upscale, continuous / ROI | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 |
+| 721x1283 downscale, continuous / ROI | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 |
+| 640x640 no-resize, continuous / ROI | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 |
+| 1x97 single-row edge case | 0 | 0 | 0 | 0 |
+
+This covers up/down scaling, no scaling, padding, synthetic full-range uint8 patterns, a single-row edge case, and stepped ROI storage. It establishes exactness for these cases and this OpenCV build; it is not a proof for every possible image dimension or a different OpenCV implementation.
+
+### Three-way benchmark results
+
+| Metric | Original Baseline mean (ms) | Previous PinnedCpu mean (ms) | Optimized CUDA mean (ms) | Optimized P50 / P95 / min (ms) |
+|---|---:|---:|---:|---:|
+| CPU preprocess / raw pack | 2.995302 | 2.782893 | 0.234316 | 0.226407 / 0.305197 / 0.186061 |
+| H2D | 0.335271 | 0.203921 | 0.111384 | 0.111136 / 0.112608 / 0.110368 |
+| GPU preprocess | 0 | 0 | 0.042053 | 0.041984 / 0.043968 / 0.039968 |
+| TensorRT inference | 1.637370 | 1.636653 | 1.638656 | 1.635328 / 1.638304 / 1.620992 |
+| D2H | 0.013487 | 0.007321 | 0.007398 | 0.007296 / 0.011392 / 0.003200 |
+| GPU pipeline | 1.986129 | 1.847895 | 1.799491 | 1.795232 / 1.802048 / 1.777376 |
+| Backend wall | 1.996916 | 1.858204 | 1.814061 | 1.802408 / 1.809540 / 1.784404 |
+| CPU postprocess | 0.001777 | 0.001399 | 0.001334 | 0.001297 / 0.001559 / 0.001146 |
+| Total wall | **4.996411** | **4.644927** | **2.052735** | **2.032542 / 2.115163 / 1.990706** |
+
+| Throughput | Original Baseline | Previous PinnedCpu | Optimized CUDA |
+|---|---:|---:|---:|
+| FPS | 200.143651 | 215.288630 | **487.155005** |
+
+### Deltas relative to original Baseline and previous stage
+
+| Metric | vs original absolute (ms) | vs original | vs Stage 1 absolute (ms) | vs Stage 1 |
+|---|---:|---:|---:|---:|
+| CPU preprocess / raw pack | -2.760986 | -92.177211% | -2.548577 | -91.580123% |
+| H2D | -0.223887 | -66.777892% | -0.092537 | -45.378887% |
+| GPU preprocess | +0.042053 | N/A | +0.042053 | N/A |
+| TensorRT inference | +0.001286 | +0.078546% | +0.002004 | +0.122416% |
+| D2H | -0.006089 | -45.149236% | +0.000077 | +1.049020% |
+| GPU pipeline | -0.186637 | -9.397038% | -0.048404 | -2.619403% |
+| Backend wall | -0.182856 | -9.156895% | -0.044143 | -2.375598% |
+| CPU postprocess | -0.000443 | -24.945770% | -0.000065 | -4.661053% |
+| Total wall | **-2.943677** | **-58.915818%** | **-2.592192** | **-55.806955%** |
+
+- Speedup over same-run original Baseline: **2.434027x**; FPS gain: **+287.011354**.
+- Speedup over same-run Stage 1 PinnedCpu: **2.262800x**; FPS gain: **+271.866375**.
+
+Relative to the separately recorded Stage 0 run, total latency changed from 4.8338 to 2.052735 ms (**-2.781065 ms, -57.533721%, 2.354810x**) and throughput changed from 206.8784 to 487.155005 FPS (**+280.276605 FPS, +135.478912%**). The same-run balanced comparisons remain the primary attribution data.
+
+### Correctness, risks, and limitations
+
+- All **200/200 measured sets** matched across all three paths: 5 boxes with identical labels and scores/coordinates within `1e-3`.
+- The raw pack time is reported as CPU preprocess for Optimized; GPU preprocessing is a separate CUDA-event metric. These overlap categories must not be added to CPU wall metrics without considering stream execution.
+- H2D payloads differ by design: Baseline/PinnedCpu copy a 4.69 MiB FP32 CHW tensor, while Optimized copies the compact raw BGR uint8 image. H2D latency is comparable as pipeline cost, not as equal-byte bandwidth.
+- The fused path explicitly requires `CV_8UC3`. Baseline and PinnedCpu retain the earlier three-channel OpenCV behavior for other depths.
+- Raw host/device staging grows on demand and remains allocated for the detector lifetime. The detector is still not safe for concurrent calls because it shares context, stream, events, and buffers.
+- Any exception after async work is submitted drains the stream before returning, preventing reuse of pinned staging while DMA is in flight.
+- Commit: `perf(trt): fuse YOLOv26 CUDA preprocessing` (hash added by the next documentation commit).
 
 ## Remaining isolated stages
 
-1. Fused CUDA letterbox, bilinear resize, BGR-to-RGB, normalization, and HWC-to-CHW.
-2. CUDA Graph replay for the fixed-shape pipeline.
-3. FP16 engine build and accuracy/latency comparison.
-4. INT8 post-training calibration and accuracy/latency comparison.
+1. CUDA Graph replay for the fixed-shape pipeline.
+2. FP16 engine build and accuracy/latency comparison.
+3. INT8 post-training calibration and accuracy/latency comparison.
 
 Each stage will append its exact code change, A/B delta, correctness result, limitations, and commit identifier after measurement.
