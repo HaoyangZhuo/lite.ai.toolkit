@@ -28,6 +28,12 @@ namespace trtcv
       }
     };
 
+    enum class PipelineMode
+    {
+      Baseline,
+      Optimized
+    };
+
     explicit TRTYoloV26(const std::string &_trt_model_path,
                        unsigned int _num_threads = 1);
 
@@ -54,6 +60,10 @@ namespace trtcv
     } ScaleParams;
 
     cudaEvent_t timing_events[4] = {nullptr, nullptr, nullptr, nullptr};
+    std::vector<float> host_input;
+    std::vector<float> host_output;
+    bool host_input_registered = false;
+    bool host_output_registered = false;
 
   private:
     void letterbox(const cv::Mat &mat, cv::Mat &mat_rs,
@@ -63,7 +73,7 @@ namespace trtcv
     void detect_impl(const cv::Mat &mat,
                      std::vector<types::Boxf> &detected_boxes,
                      float score_threshold, unsigned int topk,
-                     Timing *timing);
+                     Timing *timing, PipelineMode mode);
 
     void generate_bboxes(const ScaleParams &scale_params,
                          std::vector<types::Boxf> &detected_boxes,
@@ -75,11 +85,21 @@ namespace trtcv
     void detect(const cv::Mat &mat, std::vector<types::Boxf> &detected_boxes,
                 float score_threshold = 0.25f, unsigned int topk = 100);
 
+    void detect(const cv::Mat &mat, std::vector<types::Boxf> &detected_boxes,
+                float score_threshold, unsigned int topk, PipelineMode mode);
+
     void detect_with_timing(const cv::Mat &mat,
                             std::vector<types::Boxf> &detected_boxes,
                             Timing &timing,
                             float score_threshold = 0.25f,
                             unsigned int topk = 100);
+
+    void detect_with_timing(const cv::Mat &mat,
+                            std::vector<types::Boxf> &detected_boxes,
+                            Timing &timing,
+                            float score_threshold,
+                            unsigned int topk,
+                            PipelineMode mode);
   };
 }
 

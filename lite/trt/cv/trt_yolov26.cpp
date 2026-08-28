@@ -58,6 +58,14 @@ TRTYoloV26::TRTYoloV26(const std::string &_trt_model_path,
       output_node_dims[0][2] != 6)
     throw std::runtime_error("YOLOV26 expects one end-to-end output with shape [1,N,6]");
 
+  const std::size_t input_size = static_cast<std::size_t>(input_node_dims[0]) *
+                                 static_cast<std::size_t>(input_node_dims[1]) *
+                                 static_cast<std::size_t>(input_node_dims[2]) *
+                                 static_cast<std::size_t>(input_node_dims[3]);
+  const std::size_t output_size = static_cast<std::size_t>(output_node_dims[0][1]) * 6;
+  host_input.resize(input_size);
+  host_output.resize(output_size);
+
   for (auto &event : timing_events)
   {
     const cudaError_t status = cudaEventCreate(&event);
@@ -74,10 +82,57 @@ TRTYoloV26::TRTYoloV26(const std::string &_trt_model_path,
       check_cuda(status, "Failed to create YOLOV26 timing event");
     }
   }
+
+  cudaError_t status = cudaHostRegister(host_input.data(),
+                                        host_input.size() * sizeof(float),
+                                        cudaHostRegisterDefault);
+  if (status != cudaSuccess)
+  {
+    for (auto &event : timing_events)
+    {
+      if (event)
+      {
+        cudaEventDestroy(event);
+        event = nullptr;
+      }
+    }
+    check_cuda(status, "Failed to register YOLOV26 input host buffer");
+  }
+  host_input_registered = true;
+
+  status = cudaHostRegister(host_output.data(),
+                            host_output.size() * sizeof(float),
+                            cudaHostRegisterDefault);
+  if (status != cudaSuccess)
+  {
+    cudaHostUnregister(host_input.data());
+    host_input_registered = false;
+    for (auto &event : timing_events)
+    {
+      if (event)
+      {
+        cudaEventDestroy(event);
+        event = nullptr;
+      }
+    }
+    check_cuda(status, "Failed to register YOLOV26 output host buffer");
+  }
+  host_output_registered = true;
 }
 
 TRTYoloV26::~TRTYoloV26()
 {
+  if (host_output_registered)
+  {
+    cudaHostUnregister(host_output.data());
+    host_output_registered = false;
+  }
+  if (host_input_registered)
+  {
+    cudaHostUnregister(host_input.data());
+    host_input_registered = false;
+  }
+
   for (auto &event : timing_events)
   {
     if (event)
@@ -118,7 +173,16 @@ void TRTYoloV26::detect(const cv::Mat &mat,
                        std::vector<types::Boxf> &detected_boxes,
                        float score_threshold, unsigned int topk)
 {
-  this->detect_impl(mat, detected_boxes, score_threshold, topk, nullptr);
+  this->detect_impl(mat, detected_boxes, score_threshold, topk, nullptr,
+                    PipelineMode::Optimized);
+}
+
+void TRTYoloV26::detect(const cv::Mat &mat,
+                       std::vector<types::Boxf> &detected_boxes,
+                       float score_threshold, unsigned int topk,
+                       PipelineMode mode)
+{
+  this->detect_impl(mat, detected_boxes, score_threshold, topk, nullptr, mode);
 }
 
 void TRTYoloV26::detect_with_timing(const cv::Mat &mat,
@@ -126,13 +190,23 @@ void TRTYoloV26::detect_with_timing(const cv::Mat &mat,
                                    Timing &timing,
                                    float score_threshold, unsigned int topk)
 {
-  this->detect_impl(mat, detected_boxes, score_threshold, topk, &timing);
+  this->detect_impl(mat, detected_boxes, score_threshold, topk, &timing,
+                    PipelineMode::Optimized);
+}
+
+void TRTYoloV26::detect_with_timing(const cv::Mat &mat,
+                                   std::vector<types::Boxf> &detected_boxes,
+                                   Timing &timing,
+                                   float score_threshold, unsigned int topk,
+                                   PipelineMode mode)
+{
+  this->detect_impl(mat, detected_boxes, score_threshold, topk, &timing, mode);
 }
 
 void TRTYoloV26::detect_impl(const cv::Mat &mat,
                             std::vector<types::Boxf> &detected_boxes,
                             float score_threshold, unsigned int topk,
-                            Timing *timing)
+                            Timing *timing, PipelineMode mode)
 {
   using Clock = std::chrono::steady_clock;
 
@@ -144,6 +218,10 @@ void TRTYoloV26::detect_impl(const cv::Mat &mat,
   if (mat.channels() != 3)
     throw std::invalid_argument("YOLOV26 expects a three-channel BGR image");
 
+  std::vector<float> baseline_input;
+  std::vector<float> baseline_output;
+  std::vector<float> &input = mode == PipelineMode::Baseline ? baseline_input : host_input;
+
   const auto preprocess_start = Clock::now();
   cv::Mat mat_rs;
   ScaleParams scale_params;
@@ -152,23 +230,23 @@ void TRTYoloV26::detect_impl(const cv::Mat &mat,
   cv::cvtColor(mat_rs, mat_rs, cv::COLOR_BGR2RGB);
   mat_rs.convertTo(mat_rs, CV_32FC3, 1.f / 255.f);
 
-  std::vector<float> input;
+  const float *registered_input = mode == PipelineMode::Optimized ? host_input.data() : nullptr;
   trtcv::utils::transform::create_tensor(
       mat_rs, input, input_node_dims, trtcv::utils::transform::CHW);
+  if (mode == PipelineMode::Optimized && input.data() != registered_input)
+    throw std::runtime_error("YOLOV26 reusable input buffer was unexpectedly reallocated");
   const auto preprocess_end = Clock::now();
 
   const auto backend_start = Clock::now();
-  const std::size_t input_size = static_cast<std::size_t>(input_node_dims[0]) *
-                                 static_cast<std::size_t>(input_node_dims[1]) *
-                                 static_cast<std::size_t>(input_node_dims[2]) *
-                                 static_cast<std::size_t>(input_node_dims[3]);
   const auto &pred_dims = output_node_dims[0];
   const std::size_t num_predictions = static_cast<std::size_t>(pred_dims[1]);
-  std::vector<float> output(num_predictions * 6);
+  if (mode == PipelineMode::Baseline)
+    baseline_output.resize(num_predictions * 6);
+  std::vector<float> &output = mode == PipelineMode::Baseline ? baseline_output : host_output;
 
   if (timing)
     check_cuda(cudaEventRecord(timing_events[0], stream), "Failed to record YOLOV26 H2D start");
-  check_cuda(cudaMemcpyAsync(buffers[0], input.data(), input_size * sizeof(float),
+  check_cuda(cudaMemcpyAsync(buffers[0], input.data(), input.size() * sizeof(float),
                              cudaMemcpyHostToDevice, stream),
              "YOLOV26 input copy failed");
   if (timing)
