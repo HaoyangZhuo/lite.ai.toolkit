@@ -226,12 +226,105 @@ Relative to the separately recorded Stage 0 run, total latency changed from 4.83
 - The fused path explicitly requires `CV_8UC3`. Baseline and PinnedCpu retain the earlier three-channel OpenCV behavior for other depths.
 - Raw host/device staging grows on demand and remains allocated for the detector lifetime. The detector is still not safe for concurrent calls because it shares context, stream, events, and buffers.
 - Any exception after async work is submitted drains the stream before returning, preventing reuse of pinned staging while DMA is in flight.
-- Commit: `perf(trt): fuse YOLOv26 CUDA preprocessing` (hash added by the next documentation commit).
+- Commit: `cf713c1` (`perf(trt): fuse YOLOv26 CUDA preprocessing`).
+
+## Stage 3: CUDA Graph replay
+
+### Motivation and implementation
+
+After fused preprocessing, the remaining pipeline still submitted raw H2D, the preprocess kernel, every TensorRT kernel, D2H, and timing events separately on each frame. Stage 3 captures that fixed pipeline after a normal-stream TensorRT warmup and replays one `cudaGraphExec_t` per frame.
+
+The three benchmark modes are now:
+
+- `Baseline`: original pageable/OpenCV path.
+- `CudaStream`: the exact cumulative Stage 2 fused path submitted normally; this is the previous-stage comparator.
+- `Optimized`: CUDA Graph replay of raw H2D, fused preprocessing, `enqueueV3`, D2H, and five timing-event nodes.
+
+Graph reuse requires the same source width, height, type, compact row/image byte counts, pinned host addresses, raw/input/output device addresses, and pinned output address. A mismatched source shape uses `CudaStream` fallback without discarding the valid graph. Staging growth synchronizes, destroys the graph before freeing captured addresses, grows both buffers, and permits recapture. Capture is attempted up to three times so a transient error does not permanently disable acceleration. A launch/synchronization error quarantines the graph; stream fallback is allowed only if synchronization confirms that the stream remains usable.
+
+The graph uses `cudaEventRecordWithFlags(..., cudaEventRecordExternal)` so captured events are actual event-record nodes and remain valid for elapsed-time queries after replay. This behavior follows the [CUDA Runtime event API](https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__EVENT.html). Content was rephrased for compliance with licensing restrictions.
+
+### Reproduction
+
+```bash
+./benchmark_yolov26_trt.sh \
+  build/yolo26-export/yolo26n_fp32.engine \
+  examples/lite/resources/test_lite_detection_1.jpg \
+  20 200
+```
+
+Before measured sampling, the benchmark hard-gates:
+
+- graph capture plus first replay for the benchmark shape;
+- guaranteed-different source dimensions using normal-stream fallback with matching detections;
+- reuse of the original graph after that shape fallback;
+- post-capture growth to a 2048x2048 staging payload, graph destruction before address replacement, stream correctness versus Baseline, and recapture for the benchmark shape.
+
+### Three-way benchmark results
+
+| Metric | Original Baseline mean (ms) | Previous CudaStream mean (ms) | Optimized Graph mean (ms) | Graph P50 / P95 / min (ms) |
+|---|---:|---:|---:|---:|
+| CPU preprocess / raw pack | 3.082117 | 0.198051 | 0.196054 | 0.183591 / 0.259552 / 0.169290 |
+| H2D | 0.360364 | 0.111211 | 0.110156 | 0.110112 / 0.111488 / 0.108800 |
+| GPU preprocess | 0 | 0.042003 | 0.044955 | 0.045280 / 0.048640 / 0.040832 |
+| TensorRT inference | 1.665680 | 1.655743 | 1.474074 | 1.462272 / 1.670144 / 1.449984 |
+| D2H | 0.013034 | 0.007449 | 0.007598 | 0.007264 / 0.011360 / 0.003168 |
+| GPU pipeline | 2.039078 | 1.816405 | 1.636782 | 1.624800 / 1.833440 / 1.609728 |
+| Backend wall | 2.050048 | 1.823696 | 1.646518 | 1.634457 / 1.841854 / 1.618930 |
+| CPU postprocess | 0.001711 | 0.001139 | 0.001028 | 0.001010 / 0.001204 / 0.000856 |
+| Total wall | **5.136434** | **2.025846** | **1.846252** | **1.821228 / 2.029509 / 1.795716** |
+
+| Throughput | Original Baseline | Previous CudaStream | Optimized Graph |
+|---|---:|---:|---:|
+| FPS | 194.687593 | 493.621056 | **541.637771** |
+
+### Deltas relative to same-run original and previous stage
+
+| Metric | vs original absolute (ms) | vs original | vs Stage 2 absolute (ms) | vs Stage 2 |
+|---|---:|---:|---:|---:|
+| CPU preprocess / raw pack | -2.886063 | -93.638988% | -0.001998 | -1.008597% |
+| H2D | -0.250208 | -69.432125% | -0.001055 | -0.948687% |
+| GPU preprocess | +0.044955 | N/A | +0.002952 | +7.028905% |
+| TensorRT inference | -0.191607 | -11.503201% | -0.181669 | -10.972051% |
+| D2H | -0.005436 | -41.707791% | +0.000149 | +1.995403% |
+| GPU pipeline | -0.402296 | -19.729310% | -0.179623 | -9.888930% |
+| Backend wall | -0.403530 | -19.683931% | -0.177178 | -9.715331% |
+| CPU postprocess | -0.000684 | -39.947468% | -0.000111 | -9.772918% |
+| Total wall | **-3.290182** | **-64.055758%** | **-0.179593** | **-8.865097%** |
+
+- Speedup over same-run original Baseline: **2.782087x**; FPS gain: **+346.950178**.
+- Speedup over same-run Stage 2 CudaStream: **1.097274x**; FPS gain: **+48.016715**.
+
+Relative to the separately recorded Stage 0 run:
+
+| Metric | Stage 0 mean | Stage 3 Graph mean | Absolute delta | Delta |
+|---|---:|---:|---:|---:|
+| CPU preprocess / raw pack (ms) | 2.7208 | 0.196054 | -2.524746 | -92.794252% |
+| H2D (ms) | 0.3102 | 0.110156 | -0.200044 | -64.488717% |
+| TensorRT inference (ms) | 1.7748 | 1.474074 | -0.300726 | -16.944219% |
+| D2H (ms) | 0.0131 | 0.007598 | -0.005502 | -42.000000% |
+| GPU pipeline (ms) | 2.0981 | 1.636782 | -0.461318 | -21.987417% |
+| Backend wall (ms) | 2.1076 | 1.646518 | -0.461082 | -21.877111% |
+| CPU postprocess (ms) | 0.0030 | 0.001028 | -0.001972 | -65.733333% |
+| Total wall (ms) | 4.8338 | 1.846252 | -2.987548 | -61.805371% |
+| FPS | 206.8784 | 541.637771 | +334.759371 | +161.814559% |
+
+Cross-run final speedup over Stage 0: **2.618169x**.
+
+### Correctness, risks, and limitations
+
+- **200/200 measured Optimized calls used graph replay**, with **0 measured fallbacks**.
+- All 200 measured sets matched Baseline/CudaStream/Graph: 5 boxes with identical labels and scores/coordinates within `1e-3`.
+- Shape fallback, graph reuse after fallback, staging growth, graph destruction before captured-address replacement, and recapture all passed before timing.
+- The inference event segment improves because TensorRT's captured device launches are replayed as graph work, reducing gaps between internal kernels; it is not a change to FP32 arithmetic or engine precision.
+- Graph replay remains shape/address-specific. Nonmatching images use safe stream fallback rather than graph updates. A detector holds one active graph signature at a time.
+- Five external event nodes are intentionally part of both measured graph and normal-stream paths. They make segment timing reproducible but add small overhead to production calls.
+- The detector remains single-call-at-a-time and is not thread-safe.
+- Commit: `perf(trt): replay YOLOv26 pipeline with CUDA Graph` (hash added by the next documentation commit).
 
 ## Remaining isolated stages
 
-1. CUDA Graph replay for the fixed-shape pipeline.
-2. FP16 engine build and accuracy/latency comparison.
-3. INT8 post-training calibration and accuracy/latency comparison.
+1. FP16 engine build and accuracy/latency comparison.
+2. INT8 post-training calibration and accuracy/latency comparison.
 
 Each stage will append its exact code change, A/B delta, correctness result, limitations, and commit identifier after measurement.

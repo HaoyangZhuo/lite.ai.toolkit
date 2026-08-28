@@ -127,6 +127,7 @@ TRTYoloV26::TRTYoloV26(const std::string &_trt_model_path,
 TRTYoloV26::~TRTYoloV26()
 {
   if (stream) cudaStreamSynchronize(stream);
+  destroy_cuda_graph();
 
   if (device_image)
   {
@@ -221,6 +222,7 @@ void TRTYoloV26::ensure_image_buffers(std::size_t required_bytes)
     check_cuda(device_status, "Failed to allocate YOLOV26 device image buffer");
   }
 
+  destroy_cuda_graph();
   if (device_image) cudaFree(device_image);
   if (host_image) cudaFreeHost(host_image);
   host_image = new_host;
@@ -258,6 +260,176 @@ void TRTYoloV26::enqueue_cuda_preprocess(const cv::Mat &mat,
                  scale_params.resized_width, scale_params.resized_height,
                  scale_params.left, scale_params.top, stream),
              "Failed to launch YOLOV26 fused CUDA preprocessing");
+}
+
+void TRTYoloV26::enqueue_fused_pipeline(const cv::Mat &mat,
+                                        const ScaleParams &scale_params,
+                                        std::size_t output_size,
+                                        bool external_timing_events)
+{
+  const auto record_event = [this, external_timing_events](cudaEvent_t event,
+                                                            const char *operation)
+  {
+    const cudaError_t status = external_timing_events
+        ? cudaEventRecordWithFlags(event, stream, cudaEventRecordExternal)
+        : cudaEventRecord(event, stream);
+    check_cuda(status, operation);
+  };
+  const std::size_t image_bytes = static_cast<std::size_t>(mat.rows) *
+                                  static_cast<std::size_t>(mat.cols) * mat.elemSize();
+  record_event(timing_events[0], "Failed to record YOLOV26 raw H2D start");
+  check_cuda(cudaMemcpyAsync(device_image, host_image, image_bytes,
+                             cudaMemcpyHostToDevice, stream),
+             "YOLOV26 raw image copy failed");
+  record_event(timing_events[1], "Failed to record YOLOV26 raw H2D end");
+  enqueue_cuda_preprocess(mat, scale_params);
+  record_event(timing_events[2], "Failed to record YOLOV26 inference start");
+  if (!trt_context->enqueueV3(stream))
+    throw std::runtime_error("Failed to infer YOLOV26 with TensorRT");
+  record_event(timing_events[3], "Failed to record YOLOV26 inference end");
+  check_cuda(cudaMemcpyAsync(host_output.data(), buffers[1],
+                             output_size * sizeof(float),
+                             cudaMemcpyDeviceToHost, stream),
+             "YOLOV26 output copy failed");
+  record_event(timing_events[4], "Failed to record YOLOV26 output D2H end");
+}
+
+void TRTYoloV26::run_fused_stream_pipeline(const cv::Mat &mat,
+                                           const ScaleParams &scale_params,
+                                           std::size_t output_size)
+{
+  try
+  {
+    enqueue_fused_pipeline(mat, scale_params, output_size);
+    check_cuda(cudaStreamSynchronize(stream),
+               "YOLOV26 fused stream synchronization failed");
+  }
+  catch (...)
+  {
+    cudaStreamSynchronize(stream);
+    throw;
+  }
+}
+
+void TRTYoloV26::destroy_cuda_graph() noexcept
+{
+  if (cuda_graph_exec)
+  {
+    cudaGraphExecDestroy(cuda_graph_exec);
+    cuda_graph_exec = nullptr;
+  }
+  if (cuda_graph)
+  {
+    cudaGraphDestroy(cuda_graph);
+    cuda_graph = nullptr;
+  }
+  graph_signature = GraphSignature{};
+}
+
+bool TRTYoloV26::graph_matches(const cv::Mat &mat) const noexcept
+{
+  const std::size_t row_bytes = static_cast<std::size_t>(mat.cols) * mat.elemSize();
+  const std::size_t image_bytes = row_bytes * static_cast<std::size_t>(mat.rows);
+  return cuda_graph_exec &&
+         graph_signature.width == mat.cols &&
+         graph_signature.height == mat.rows &&
+         graph_signature.type == mat.type() &&
+         graph_signature.row_bytes == row_bytes &&
+         graph_signature.image_bytes == image_bytes &&
+         graph_signature.host_image_address == host_image &&
+         graph_signature.device_image_address == device_image &&
+         graph_signature.input_device_address == buffers[0] &&
+         graph_signature.output_device_address == buffers[1] &&
+         graph_signature.output_host_address == host_output.data();
+}
+
+bool TRTYoloV26::capture_cuda_graph(const cv::Mat &mat,
+                                    const ScaleParams &scale_params,
+                                    std::size_t output_size)
+{
+  constexpr unsigned int max_capture_attempts = 3;
+  if (graph_capture_failures >= max_capture_attempts) return false;
+
+  // TensorRT and CUDA lazy resources must be initialized outside capture.
+  run_fused_stream_pipeline(mat, scale_params, output_size);
+
+  cudaError_t status = cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+  if (status != cudaSuccess)
+  {
+    ++graph_capture_failures;
+    return false;
+  }
+
+  cudaGraph_t new_graph = nullptr;
+  try
+  {
+    enqueue_fused_pipeline(mat, scale_params, output_size, true);
+  }
+  catch (...)
+  {
+    cudaStreamEndCapture(stream, &new_graph);
+    if (new_graph) cudaGraphDestroy(new_graph);
+    cudaGetLastError();
+    ++graph_capture_failures;
+    return false;
+  }
+
+  status = cudaStreamEndCapture(stream, &new_graph);
+  if (status != cudaSuccess || !new_graph)
+  {
+    if (new_graph) cudaGraphDestroy(new_graph);
+    cudaGetLastError();
+    ++graph_capture_failures;
+    return false;
+  }
+
+  cudaGraphExec_t new_exec = nullptr;
+  status = cudaGraphInstantiate(&new_exec, new_graph, 0ULL);
+  if (status != cudaSuccess || !new_exec)
+  {
+    if (new_exec) cudaGraphExecDestroy(new_exec);
+    cudaGraphDestroy(new_graph);
+    ++graph_capture_failures;
+    return false;
+  }
+
+  destroy_cuda_graph();
+  cuda_graph = new_graph;
+  cuda_graph_exec = new_exec;
+  graph_signature.width = mat.cols;
+  graph_signature.height = mat.rows;
+  graph_signature.type = mat.type();
+  graph_signature.row_bytes = static_cast<std::size_t>(mat.cols) * mat.elemSize();
+  graph_signature.image_bytes = graph_signature.row_bytes * static_cast<std::size_t>(mat.rows);
+  graph_signature.host_image_address = host_image;
+  graph_signature.device_image_address = device_image;
+  graph_signature.input_device_address = buffers[0];
+  graph_signature.output_device_address = buffers[1];
+  graph_signature.output_host_address = host_output.data();
+  graph_capture_failures = 0;
+  return true;
+}
+
+bool TRTYoloV26::launch_cuda_graph()
+{
+  const cudaError_t launch_status = cudaGraphLaunch(cuda_graph_exec, stream);
+  if (launch_status != cudaSuccess)
+  {
+    const cudaError_t recovery_status = cudaStreamSynchronize(stream);
+    destroy_cuda_graph();
+    check_cuda(recovery_status,
+               "YOLOV26 stream was unhealthy after CUDA Graph launch failure");
+    return false;
+  }
+
+  const cudaError_t synchronization_status = cudaStreamSynchronize(stream);
+  if (synchronization_status != cudaSuccess)
+  {
+    destroy_cuda_graph();
+    check_cuda(synchronization_status,
+               "YOLOV26 CUDA Graph synchronization failed");
+  }
+  return true;
 }
 
 void TRTYoloV26::detect(const cv::Mat &mat,
@@ -314,8 +486,10 @@ void TRTYoloV26::detect_impl(const cv::Mat &mat,
   std::vector<float> &input = mode == PipelineMode::Baseline ? baseline_input : host_input;
   ScaleParams scale_params{};
 
+  const bool fused_mode = mode == PipelineMode::CudaStream ||
+                          mode == PipelineMode::Optimized;
   const auto preprocess_start = Clock::now();
-  if (mode == PipelineMode::Optimized)
+  if (fused_mode)
   {
     scale_params = calculate_scale_params(mat);
     pack_image(mat);
@@ -338,57 +512,68 @@ void TRTYoloV26::detect_impl(const cv::Mat &mat,
   std::vector<float> &output = mode == PipelineMode::Baseline
                                    ? baseline_output : host_output;
 
-  bool stream_work_submitted = false;
-  try
+  bool graph_replayed = false;
+  bool graph_fallback = false;
+  if (fused_mode)
   {
-    if (timing)
-      check_cuda(cudaEventRecord(timing_events[0], stream),
-                 "Failed to record YOLOV26 input H2D start");
-    if (mode == PipelineMode::Optimized)
+    if (mode == PipelineMode::CudaStream)
     {
-      const std::size_t image_bytes = static_cast<std::size_t>(mat.rows) *
-                                      static_cast<std::size_t>(mat.cols) * mat.elemSize();
-      check_cuda(cudaMemcpyAsync(device_image, host_image, image_bytes,
-                                 cudaMemcpyHostToDevice, stream),
-                 "YOLOV26 raw image copy failed");
+      run_fused_stream_pipeline(mat, scale_params, output.size());
     }
     else
     {
+      if (!graph_matches(mat) && !cuda_graph_exec)
+        capture_cuda_graph(mat, scale_params, output.size());
+      if (graph_matches(mat))
+        graph_replayed = launch_cuda_graph();
+      if (!graph_replayed)
+      {
+        graph_fallback = true;
+        run_fused_stream_pipeline(mat, scale_params, output.size());
+      }
+    }
+  }
+  else
+  {
+    bool stream_work_submitted = false;
+    try
+    {
+      if (timing)
+        check_cuda(cudaEventRecord(timing_events[0], stream),
+                   "Failed to record YOLOV26 input H2D start");
       check_cuda(cudaMemcpyAsync(buffers[0], input.data(), input.size() * sizeof(float),
                                  cudaMemcpyHostToDevice, stream),
                  "YOLOV26 input tensor copy failed");
+      stream_work_submitted = true;
+      if (timing)
+      {
+        check_cuda(cudaEventRecord(timing_events[1], stream),
+                   "Failed to record YOLOV26 input H2D end");
+        check_cuda(cudaEventRecord(timing_events[2], stream),
+                   "Failed to record YOLOV26 inference start");
+      }
+
+      if (!trt_context->enqueueV3(stream))
+        throw std::runtime_error("Failed to infer YOLOV26 with TensorRT");
+      if (timing)
+        check_cuda(cudaEventRecord(timing_events[3], stream),
+                   "Failed to record YOLOV26 inference end");
+
+      check_cuda(cudaMemcpyAsync(output.data(), buffers[1], output.size() * sizeof(float),
+                                 cudaMemcpyDeviceToHost, stream),
+                 "YOLOV26 output copy failed");
+      if (timing)
+        check_cuda(cudaEventRecord(timing_events[4], stream),
+                   "Failed to record YOLOV26 output D2H end");
+      check_cuda(cudaStreamSynchronize(stream),
+                 "YOLOV26 inference synchronization failed");
+      stream_work_submitted = false;
     }
-    stream_work_submitted = true;
-    if (timing)
-      check_cuda(cudaEventRecord(timing_events[1], stream),
-                 "Failed to record YOLOV26 input H2D end");
-
-    if (mode == PipelineMode::Optimized)
-      enqueue_cuda_preprocess(mat, scale_params);
-    if (timing)
-      check_cuda(cudaEventRecord(timing_events[2], stream),
-                 "Failed to record YOLOV26 inference start");
-
-    if (!trt_context->enqueueV3(stream))
-      throw std::runtime_error("Failed to infer YOLOV26 with TensorRT");
-    if (timing)
-      check_cuda(cudaEventRecord(timing_events[3], stream),
-                 "Failed to record YOLOV26 inference end");
-
-    check_cuda(cudaMemcpyAsync(output.data(), buffers[1], output.size() * sizeof(float),
-                               cudaMemcpyDeviceToHost, stream),
-               "YOLOV26 output copy failed");
-    if (timing)
-      check_cuda(cudaEventRecord(timing_events[4], stream),
-                 "Failed to record YOLOV26 output D2H end");
-    check_cuda(cudaStreamSynchronize(stream),
-               "YOLOV26 inference synchronization failed");
-    stream_work_submitted = false;
-  }
-  catch (...)
-  {
-    if (stream_work_submitted) cudaStreamSynchronize(stream);
-    throw;
+    catch (...)
+    {
+      if (stream_work_submitted) cudaStreamSynchronize(stream);
+      throw;
+    }
   }
   const auto backend_end = Clock::now();
 
@@ -398,7 +583,7 @@ void TRTYoloV26::detect_impl(const cv::Mat &mat,
     check_cuda(cudaEventElapsedTime(&duration, timing_events[0], timing_events[1]),
                "Failed to measure YOLOV26 H2D time");
     timing->h2d_ms = duration;
-    if (mode == PipelineMode::Optimized)
+    if (fused_mode)
     {
       check_cuda(cudaEventElapsedTime(&duration, timing_events[1], timing_events[2]),
                  "Failed to measure YOLOV26 GPU preprocess time");
@@ -424,6 +609,8 @@ void TRTYoloV26::detect_impl(const cv::Mat &mat,
     timing->backend_wall_ms = elapsed_ms(backend_start, backend_end);
     timing->postprocess_ms = elapsed_ms(postprocess_start, postprocess_end);
     timing->total_ms = elapsed_ms(total_start, postprocess_end);
+    timing->graph_replayed = graph_replayed;
+    timing->graph_fallback = graph_fallback;
   }
 }
 

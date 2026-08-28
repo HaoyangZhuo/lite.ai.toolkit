@@ -24,6 +24,8 @@ namespace trtcv
       double backend_wall_ms = 0.0;
       double postprocess_ms = 0.0;
       double total_ms = 0.0;
+      bool graph_replayed = false;
+      bool graph_fallback = false;
 
       double gpu_pipeline_ms() const
       {
@@ -44,6 +46,7 @@ namespace trtcv
     {
       Baseline,
       PinnedCpu,
+      CudaStream,
       Optimized
     };
 
@@ -83,6 +86,25 @@ namespace trtcv
     unsigned char *device_image = nullptr;
     std::size_t image_capacity = 0;
 
+    struct GraphSignature
+    {
+      int width = 0;
+      int height = 0;
+      int type = -1;
+      std::size_t row_bytes = 0;
+      std::size_t image_bytes = 0;
+      const void *host_image_address = nullptr;
+      const void *device_image_address = nullptr;
+      const void *input_device_address = nullptr;
+      const void *output_device_address = nullptr;
+      const void *output_host_address = nullptr;
+    };
+
+    cudaGraph_t cuda_graph = nullptr;
+    cudaGraphExec_t cuda_graph_exec = nullptr;
+    GraphSignature graph_signature{};
+    unsigned int graph_capture_failures = 0;
+
   private:
     ScaleParams calculate_scale_params(const cv::Mat &mat) const;
 
@@ -95,6 +117,25 @@ namespace trtcv
 
     void enqueue_cuda_preprocess(const cv::Mat &mat,
                                  const ScaleParams &scale_params);
+
+    void enqueue_fused_pipeline(const cv::Mat &mat,
+                                const ScaleParams &scale_params,
+                                std::size_t output_size,
+                                bool external_timing_events = false);
+
+    void run_fused_stream_pipeline(const cv::Mat &mat,
+                                   const ScaleParams &scale_params,
+                                   std::size_t output_size);
+
+    bool capture_cuda_graph(const cv::Mat &mat,
+                            const ScaleParams &scale_params,
+                            std::size_t output_size);
+
+    bool graph_matches(const cv::Mat &mat) const noexcept;
+
+    bool launch_cuda_graph();
+
+    void destroy_cuda_graph() noexcept;
 
     void detect_impl(const cv::Mat &mat,
                      std::vector<types::Boxf> &detected_boxes,

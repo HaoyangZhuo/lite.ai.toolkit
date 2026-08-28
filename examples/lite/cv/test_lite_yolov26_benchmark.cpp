@@ -225,27 +225,27 @@ namespace
   std::array<PipelineMode, 3> balanced_order(int iteration)
   {
     static const std::array<std::array<PipelineMode, 3>, 6> orders = {{
-        {{PipelineMode::Baseline, PipelineMode::PinnedCpu, PipelineMode::Optimized}},
-        {{PipelineMode::Optimized, PipelineMode::Baseline, PipelineMode::PinnedCpu}},
-        {{PipelineMode::PinnedCpu, PipelineMode::Baseline, PipelineMode::Optimized}},
-        {{PipelineMode::Optimized, PipelineMode::PinnedCpu, PipelineMode::Baseline}},
-        {{PipelineMode::Baseline, PipelineMode::Optimized, PipelineMode::PinnedCpu}},
-        {{PipelineMode::PinnedCpu, PipelineMode::Optimized, PipelineMode::Baseline}}
+        {{PipelineMode::Baseline, PipelineMode::CudaStream, PipelineMode::Optimized}},
+        {{PipelineMode::Optimized, PipelineMode::Baseline, PipelineMode::CudaStream}},
+        {{PipelineMode::CudaStream, PipelineMode::Baseline, PipelineMode::Optimized}},
+        {{PipelineMode::Optimized, PipelineMode::CudaStream, PipelineMode::Baseline}},
+        {{PipelineMode::Baseline, PipelineMode::Optimized, PipelineMode::CudaStream}},
+        {{PipelineMode::CudaStream, PipelineMode::Optimized, PipelineMode::Baseline}}
     }};
     return orders[static_cast<std::size_t>(iteration) % orders.size()];
   }
 
   void run_mode(Detector &detector, const cv::Mat &image, PipelineMode mode,
                 std::vector<lite::types::Boxf> &baseline_boxes,
-                std::vector<lite::types::Boxf> &previous_boxes,
+                std::vector<lite::types::Boxf> &stream_boxes,
                 std::vector<lite::types::Boxf> &optimized_boxes,
-                Timing *baseline_timing, Timing *previous_timing,
+                Timing *baseline_timing, Timing *stream_timing,
                 Timing *optimized_timing)
   {
     if (mode == PipelineMode::Baseline)
       run_once(detector, image, mode, baseline_boxes, baseline_timing);
-    else if (mode == PipelineMode::PinnedCpu)
-      run_once(detector, image, mode, previous_boxes, previous_timing);
+    else if (mode == PipelineMode::CudaStream)
+      run_once(detector, image, mode, stream_boxes, stream_timing);
     else
       run_once(detector, image, mode, optimized_boxes, optimized_timing);
   }
@@ -288,52 +288,100 @@ int main(int argc, char *argv[])
 
     std::vector<lite::types::Boxf> reference_boxes;
     std::vector<lite::types::Boxf> baseline_boxes;
-    std::vector<lite::types::Boxf> previous_boxes;
+    std::vector<lite::types::Boxf> stream_boxes;
     std::vector<lite::types::Boxf> optimized_boxes;
+
+    Timing graph_prepare_timing;
+    run_once(detector, image, PipelineMode::Optimized, optimized_boxes,
+             &graph_prepare_timing);
+    if (!graph_prepare_timing.graph_replayed || graph_prepare_timing.graph_fallback)
+      throw std::runtime_error("CUDA Graph capture/replay is unavailable for benchmark input");
+
+    const int fallback_rows = image.rows == 319 ? 320 : 319;
+    const int fallback_cols = image.cols == 511 ? 512 : 511;
+    cv::Mat fallback_image = make_pattern(fallback_rows, fallback_cols);
+    std::vector<lite::types::Boxf> fallback_stream_boxes;
+    std::vector<lite::types::Boxf> fallback_graph_boxes;
+    Timing fallback_stream_timing;
+    Timing fallback_graph_timing;
+    run_once(detector, fallback_image, PipelineMode::CudaStream,
+             fallback_stream_boxes, &fallback_stream_timing);
+    run_once(detector, fallback_image, PipelineMode::Optimized,
+             fallback_graph_boxes, &fallback_graph_timing);
+    if (!fallback_graph_timing.graph_fallback || fallback_graph_timing.graph_replayed ||
+        !same_boxes(fallback_stream_boxes, fallback_graph_boxes))
+      throw std::runtime_error("CUDA Graph shape-mismatch fallback validation failed");
+
+    run_once(detector, image, PipelineMode::Optimized, optimized_boxes,
+             &graph_prepare_timing);
+    if (!graph_prepare_timing.graph_replayed || graph_prepare_timing.graph_fallback)
+      throw std::runtime_error("CUDA Graph was not reusable after shape fallback");
+
+    cv::Mat growth_image = make_pattern(2048, 2048);
+    std::vector<lite::types::Boxf> growth_baseline_boxes;
+    std::vector<lite::types::Boxf> growth_stream_boxes;
+    run_once(detector, growth_image, PipelineMode::Baseline,
+             growth_baseline_boxes, nullptr);
+    run_once(detector, growth_image, PipelineMode::CudaStream,
+             growth_stream_boxes, nullptr);
+    if (!same_boxes(growth_baseline_boxes, growth_stream_boxes))
+      throw std::runtime_error("CUDA Graph staging-growth correctness validation failed");
+
+    run_once(detector, image, PipelineMode::Optimized, optimized_boxes,
+             &graph_prepare_timing);
+    if (!graph_prepare_timing.graph_replayed || graph_prepare_timing.graph_fallback)
+      throw std::runtime_error("CUDA Graph did not recapture after staging growth");
 
     for (int i = 0; i < warmup; ++i)
     {
       for (const PipelineMode mode : balanced_order(i))
-        run_mode(detector, image, mode, baseline_boxes, previous_boxes,
+        run_mode(detector, image, mode, baseline_boxes, stream_boxes,
                  optimized_boxes, nullptr, nullptr, nullptr);
-      if (!same_boxes(baseline_boxes, previous_boxes) ||
+      if (!same_boxes(baseline_boxes, stream_boxes) ||
           !same_boxes(baseline_boxes, optimized_boxes))
-        throw std::runtime_error("Baseline, previous, and optimized detections differ during warmup");
+        throw std::runtime_error("Baseline, CUDA stream, and CUDA Graph detections differ during warmup");
       reference_boxes = baseline_boxes;
     }
 
     Samples baseline;
-    Samples previous;
+    Samples stream_samples;
     Samples optimized;
     baseline.reserve(static_cast<std::size_t>(iterations));
-    previous.reserve(static_cast<std::size_t>(iterations));
+    stream_samples.reserve(static_cast<std::size_t>(iterations));
     optimized.reserve(static_cast<std::size_t>(iterations));
+    int measured_graph_replays = 0;
+    int measured_graph_fallbacks = 0;
 
     for (int i = 0; i < iterations; ++i)
     {
       Timing baseline_timing;
-      Timing previous_timing;
+      Timing stream_timing;
       Timing optimized_timing;
       for (const PipelineMode mode : balanced_order(i))
-        run_mode(detector, image, mode, baseline_boxes, previous_boxes,
-                 optimized_boxes, &baseline_timing, &previous_timing,
+        run_mode(detector, image, mode, baseline_boxes, stream_boxes,
+                 optimized_boxes, &baseline_timing, &stream_timing,
                  &optimized_timing);
 
       if (!same_boxes(reference_boxes, baseline_boxes) ||
-          !same_boxes(reference_boxes, previous_boxes) ||
+          !same_boxes(reference_boxes, stream_boxes) ||
           !same_boxes(reference_boxes, optimized_boxes))
         throw std::runtime_error("Detection output changed during three-way benchmark");
 
+      if (!optimized_timing.graph_replayed || optimized_timing.graph_fallback)
+        throw std::runtime_error("Optimized sample did not use CUDA Graph replay");
+      ++measured_graph_replays;
+      if (optimized_timing.graph_fallback) ++measured_graph_fallbacks;
+
       baseline.append(baseline_timing);
-      previous.append(previous_timing);
+      stream_samples.append(stream_timing);
       optimized.append(optimized_timing);
     }
 
     const double baseline_total = summarize(baseline.total).mean;
-    const double previous_total = summarize(previous.total).mean;
+    const double stream_samples_total = summarize(stream_samples.total).mean;
     const double optimized_total = summarize(optimized.total).mean;
     const double baseline_fps = 1000.0 / baseline_total;
-    const double previous_fps = 1000.0 / previous_total;
+    const double stream_samples_fps = 1000.0 / stream_samples_total;
     const double optimized_fps = 1000.0 / optimized_total;
 
     std::cout << std::fixed << std::setprecision(6);
@@ -344,21 +392,25 @@ int main(int argc, char *argv[])
     std::cout << "boxes," << reference_boxes.size() << '\n';
     std::cout << "consistency_checks," << iterations << '\n';
     std::cout << "consistency,passed\n";
+    std::cout << "graph_replays," << measured_graph_replays << '\n';
+    std::cout << "graph_fallbacks," << measured_graph_fallbacks << '\n';
+    std::cout << "shape_fallback_validation,passed\n";
+    std::cout << "staging_growth_validation,passed\n";
     std::cout << "mode,metric,mean_ms,p50_ms,p95_ms,min_ms\n";
     print_samples("baseline", baseline);
-    print_samples("previous_pinned_cpu", previous);
-    print_samples("optimized_cuda", optimized);
+    print_samples("previous_cuda_stream", stream_samples);
+    print_samples("optimized_cuda_graph", optimized);
     std::cout << "mode,throughput_fps\n";
     std::cout << "baseline," << baseline_fps << '\n';
-    std::cout << "previous_pinned_cpu," << previous_fps << '\n';
-    std::cout << "optimized_cuda," << optimized_fps << '\n';
+    std::cout << "previous_cuda_stream," << stream_samples_fps << '\n';
+    std::cout << "optimized_cuda_graph," << optimized_fps << '\n';
     std::cout << "comparison,metric,reference_mean_ms,optimized_mean_ms,delta_ms,delta_percent\n";
     print_comparisons("from_baseline", baseline, optimized);
-    print_comparisons("from_previous", previous, optimized);
+    print_comparisons("from_previous_cuda_stream", stream_samples, optimized);
     std::cout << "speedup_from_baseline," << baseline_total / optimized_total << '\n';
-    std::cout << "speedup_from_previous," << previous_total / optimized_total << '\n';
+    std::cout << "speedup_from_previous_cuda_stream," << stream_samples_total / optimized_total << '\n';
     std::cout << "fps_delta_from_baseline," << optimized_fps - baseline_fps << '\n';
-    std::cout << "fps_delta_from_previous," << optimized_fps - previous_fps << '\n';
+    std::cout << "fps_delta_from_previous_cuda_stream," << optimized_fps - stream_samples_fps << '\n';
     return EXIT_SUCCESS;
   }
   catch (const std::exception &error)
